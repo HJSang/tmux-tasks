@@ -28,7 +28,7 @@ brew tap HJSang/tap
 brew install tmux-tasks
 ```
 
-Requires `tmux`. `jq` is only needed for `agent-scan --json`.
+Requires `tmux`. `jq` is needed for `agent-scan --json` and `serve`; `python3` for `serve`.
 
 ## Usage
 
@@ -87,9 +87,9 @@ tmt serve --lines 80                             # show more pane scrollback per
 
 The page is **organized by status into tabs** — `all`, `waiting`, `stale`, `running`, `idle` — with a live count on each. Click a tab to see just those sessions; the `all` tab stays attention-first (WAITING and STALE on top, then RUNNING, then IDLE). Each card shows a colored state dot, the foreground process, and recent terminal output.
 
-Tabs use CSS `:target` (anchor links like `#waiting`), so the selected tab **persists across the auto-refresh** and the whole page still needs **zero client-side JavaScript** — the `<meta refresh>` matching `--interval` reloads it, and the URL fragment keeps you on your chosen tab.
+**Only the terminal contents refresh — never the whole page.** The server writes the HTML shell once, then republishes a small `data.json` every `--interval` seconds; a tiny client script polls it and updates just the changed cards in place. That means your selected tab stays put, and each terminal's scroll position is preserved (a card that's scrolled to the bottom keeps following new output; one you've scrolled up to read is left alone). No more full-page reload snapping the tab back to `all`. Tabs still use CSS `:target` (anchor links like `#waiting`) for zero-reload switching.
 
-It's **read-only** — the dashboard only displays state; it never sends input. The server binds to `127.0.0.1` only (panes can contain secrets, so nothing is exposed on the network), regenerates the page in a private temp dir, and cleans up on `Ctrl-C`. Requires `python3` (for the built-in `http.server`).
+It's **read-only** — the dashboard only displays state; it never sends input. The server binds to `127.0.0.1` only (panes can contain secrets, so nothing is exposed on the network), regenerates `data.json` in a private temp dir, and cleans up on `Ctrl-C`. Requires `python3` (for the built-in `http.server`) and `jq`.
 
 ### States
 

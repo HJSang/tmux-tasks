@@ -41,7 +41,8 @@ tmt capture SESSION --lines 200  # more scrollback when you need context
 If the **user** wants to watch the fleet themselves, point them at the
 status-tabbed browser dashboard — tell them to run it in their own terminal,
 don't run it for them: `tmt serve` (opens http://127.0.0.1:8787/, tabs for
-all/waiting/stale/running/idle, auto-refreshing, read-only).
+all/waiting/stale/running/idle, read-only). It refreshes only the terminal
+contents in place — the selected tab and each pane's scroll stay put.
 
 State field meanings:
 - `RUNNING` — a non-shell process is working; output moving.

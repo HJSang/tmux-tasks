@@ -42,7 +42,7 @@
 
 set -uo pipefail
 
-TMT_VERSION="0.3.2"
+TMT_VERSION="0.3.3"
 
 # Stable exit codes (see DESIGN.md §5) so a program consumer can branch on them.
 EX_OK=0; EX_USAGE=2; EX_NOSESSION=3; EX_LOCKED=4; EX_POLICY=5; EX_NOTMUX=6; EX_TIMEOUT=7
@@ -402,87 +402,69 @@ cmd_agent_scan() {
 
 # --- serve: live HTML dashboard -------------------------------------------
 #
-# Regenerates a static index.html from the same scan data agent-scan uses, then
-# serves the directory with `python3 -m http.server`. The page carries a
-# <meta http-equiv="refresh"> matching the poll interval, so a browser shows
-# near-real-time state with zero client JS. Read-only: it never sends input.
+# Serves a static index.html shell once, plus a data.json the shell polls every
+# $interval seconds. A small client-side script fetches data.json and updates
+# only the changed card contents in place — so the page never reloads, each
+# terminal's scroll position is preserved, and the selected status tab stays
+# put. Read-only: it never sends input.
 #
 # Bound to 127.0.0.1 only — panes can contain secrets, so we never expose them
 # on the network.
 
-# HTML-escape stdin (&, <, > only — enough for text nodes / <pre>).
-_html_escape() { sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'; }
-
-# Map a state to a CSS class name (reused as color keys in the page's <style>).
-_serve_state_class() {
-  case "$1" in
-    RUNNING) printf 'running' ;; WAITING) printf 'waiting' ;;
-    STALE)   printf 'stale' ;;   IDLE)    printf 'idle' ;;
-    *)       printf 'unknown' ;;
-  esac
-}
-
-# Emit one <div class="card"> for row index $1, using the rows_* arrays.
-# Relies on rows_sess/rows_state/rows_cmd/rows_task/rows_pane being in scope.
-_serve_emit_card() {
-  local i="$1"
-  local klass; klass=$(_serve_state_class "${rows_state[i]}")
-  local esc_sess esc_cmd esc_task esc_pane
-  esc_sess=$(printf '%s' "${rows_sess[i]}" | _html_escape)
-  esc_cmd=$(printf '%s'  "${rows_cmd[i]}"  | _html_escape)
-  esc_task=$(printf '%s' "${rows_task[i]}" | _html_escape)
-  esc_pane=$(printf '%s' "${rows_pane[i]}" | _html_escape)
-  printf '<div class="card">\n'
-  printf '  <header>\n'
-  printf '    <span class="dot %s"></span>\n' "$klass"
-  printf '    <span class="name">%s</span>\n' "$esc_sess"
-  printf '    <span class="state-tag %s">%s</span>\n' "$klass" "${rows_state[i]}"
-  [[ -n "$esc_task" ]] && printf '    <span class="task">%s</span>\n' "$esc_task"
-  printf '    <span class="fg">%s</span>\n' "$esc_cmd"
-  printf '  </header>\n'
-  printf '  <pre>%s</pre>\n' "$esc_pane"
-  printf '</div>\n'
-}
-
-# Write one complete dashboard HTML document to stdout.
-# Args: filter interval lines
-_serve_render_html() {
-  local filter="$1" interval="$2" lines="$3"
+# Write the live session data as JSON to stdout: an object with a per-state
+# count map and an ordered sessions array. detect() mutates per-session hash
+# state, so it must be called exactly once per session here.
+# Args: filter lines
+_serve_render_json() {
+  local filter="$1" lines="$2"
   local now; now=$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null || date)
 
-  # Gather rows first so we can show a summary count in the header. detect()
-  # mutates per-session hash state, so call it exactly once per session here.
-  local -a rows_sess rows_state rows_cmd rows_task rows_pane
-  local n=0
-  local sess line st rest cmd task pane
+  local first=1
+  local sessions_json=''
+  local c_running=0 c_waiting=0 c_stale=0 c_idle=0 c_other=0 n=0
+  local sess line st rest cmd task pane obj
   while IFS= read -r sess; do
     [[ -z "$sess" ]] && continue
     line=$(detect "$sess")
     st=${line%%$'\t'*}; rest=${line#*$'\t'}; cmd=${rest%%$'\t'*}
     task=$(reg_get "$sess" task)
     pane=$(tmux capture-pane -t "$sess" -p -S "-$lines" 2>/dev/null)
-    rows_sess[n]="$sess"; rows_state[n]="$st"; rows_cmd[n]="$cmd"
-    rows_task[n]="$task"; rows_pane[n]="$pane"
-    n=$((n+1))
-  done < <(list_sessions "$filter")
-
-  # Per-state counts for the header badges.
-  local c_running=0 c_waiting=0 c_stale=0 c_idle=0 i
-  for ((i=0; i<n; i++)); do
-    case "${rows_state[i]}" in
+    case "$st" in
       RUNNING) c_running=$((c_running+1)) ;;
       WAITING) c_waiting=$((c_waiting+1)) ;;
       STALE)   c_stale=$((c_stale+1)) ;;
       IDLE)    c_idle=$((c_idle+1)) ;;
+      *)       c_other=$((c_other+1)) ;;
     esac
-  done
+    n=$((n+1))
+    obj=$(jq -n --arg s "$sess" --arg st "$st" --arg c "$cmd" \
+                --arg t "$task" --arg p "$pane" \
+      '{session:$s, state:$st, fg_process:$c, task:$t, pane:$p}')
+    if [[ $first -eq 1 ]]; then sessions_json="$obj"; first=0
+    else sessions_json="$sessions_json,$obj"; fi
+  done < <(list_sessions "$filter")
 
+  jq -n --arg now "$now" --arg filter "$filter" \
+        --argjson running "$c_running" --argjson waiting "$c_waiting" \
+        --argjson stale "$c_stale" --argjson idle "$c_idle" \
+        --argjson other "$c_other" --argjson n "$n" \
+        --argjson sessions "[${sessions_json}]" \
+    '{updated:$now, filter:$filter, n:$n,
+      counts:{running:$running, waiting:$waiting, stale:$stale, idle:$idle, other:$other},
+      sessions:$sessions}'
+}
+
+# Write the static dashboard shell to stdout. It is generated once; all live
+# updates happen client-side by polling data.json.
+# Args: filter interval
+_serve_render_shell() {
+  local filter="$1" interval="$2"
+  local interval_ms=$((interval * 1000))
   cat <<HTMLHEAD
 <!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta http-equiv="refresh" content="$interval">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>tmt dashboard</title>
 <style>
@@ -492,8 +474,8 @@ _serve_render_html() {
          margin: 0; padding: 1.2rem; background: #0b0f14; color: #d7dde3; }
   h1 { font-size: 1.1rem; margin: 0 0 .2rem; }
   .meta { color: #7d8794; font-size: .82rem; margin-bottom: 1rem; }
-  /* Status tabs via :target — the URL fragment (#waiting, ...) survives the
-     <meta refresh> reload, so the chosen tab persists with zero JavaScript. */
+  /* Status tabs via :target — the URL fragment (#waiting, ...) selects a panel
+     with zero page reloads; JS only swaps card contents, so the tab persists. */
   .tabs { display: flex; gap: .4rem; flex-wrap: wrap; margin-bottom: 1rem; }
   .tab { padding: .2rem .7rem; border-radius: 999px; font-size: .8rem;
          border: 1px solid #263040; text-decoration: none; color: #9aa4b0;
@@ -526,71 +508,146 @@ _serve_render_html() {
   .dot.running { background:#4ade80; } .dot.waiting { background:#fbbf24; }
   .dot.stale   { background:#f87171; } .dot.idle    { background:#6b7480; }
   .dot.unknown { background:#9aa4b0; }
-  .empty { color: #7d8794; padding: 2rem; text-align: center; }
+  .stale-conn { opacity: .55; }
 </style>
 </head>
 <body>
 <h1>tmt — live session dashboard</h1>
-<div class="meta">filter <code>$filter</code> · refresh ${interval}s · updated $now · $n session(s)</div>
+<div class="meta" id="meta">filter <code>$filter</code> · refresh ${interval}s · connecting…</div>
 <nav class="tabs">
-  <a class="tab" href="#all">all <span class="count">$n</span></a>
-  <a class="tab waiting" href="#waiting">⏳ waiting <span class="count">$c_waiting</span></a>
-  <a class="tab stale"   href="#stale">■ stale <span class="count">$c_stale</span></a>
-  <a class="tab running" href="#running">▶ running <span class="count">$c_running</span></a>
-  <a class="tab idle"    href="#idle">· idle <span class="count">$c_idle</span></a>
+  <a class="tab" href="#all">all <span class="count" id="cnt-all">0</span></a>
+  <a class="tab waiting" href="#waiting">⏳ waiting <span class="count" id="cnt-waiting">0</span></a>
+  <a class="tab stale"   href="#stale">■ stale <span class="count" id="cnt-stale">0</span></a>
+  <a class="tab running" href="#running">▶ running <span class="count" id="cnt-running">0</span></a>
+  <a class="tab idle"    href="#idle">· idle <span class="count" id="cnt-idle">0</span></a>
 </nav>
+<section class="panel" id="waiting"></section>
+<section class="panel" id="stale"></section>
+<section class="panel" id="running"></section>
+<section class="panel" id="idle"></section>
+<section class="panel" id="all"></section>
+<script>
+// Poll data.json and reconcile cards in place. We never reload the page or
+// replace whole panels wholesale — cards are keyed by session name and moved
+// with appendChild, so each <pre>'s scroll position and the selected tab (a
+// URL :target) are preserved across updates. Only changed text is rewritten.
+const INTERVAL = $interval_ms;
+const STATE_CLASS = {RUNNING:'running', WAITING:'waiting', STALE:'stale', IDLE:'idle'};
+const TAG = {RUNNING:'▶', WAITING:'⏳', STALE:'■', IDLE:'·'};
+// Which sessions land in each panel, and in what order.
+const ATTENTION = ['WAITING','STALE','RUNNING','IDLE','OTHER'];
+function stateClass(s){ return STATE_CLASS[s] || 'unknown'; }
+
+// Build (once) or update (in place) one card node for a session in a panel.
+function upsertCard(panel, sess, key){
+  const id = 'card-' + panel.id + '-' + key;
+  let card = document.getElementById(id);
+  if(!card){
+    card = document.createElement('div');
+    card.className = 'card';
+    card.id = id;
+    card.innerHTML =
+      '<header>' +
+        '<span class="dot"></span>' +
+        '<span class="name"></span>' +
+        '<span class="state-tag"></span>' +
+        '<span class="task"></span>' +
+        '<span class="fg"></span>' +
+      '</header><pre></pre>';
+  }
+  const kl = stateClass(sess.state);
+  card.querySelector('.dot').className = 'dot ' + kl;
+  const nm = card.querySelector('.name');
+  if(nm.textContent !== sess.session) nm.textContent = sess.session;
+  const tg = card.querySelector('.state-tag');
+  tg.className = 'state-tag ' + kl;
+  const tgtext = (TAG[sess.state]||'') + ' ' + sess.state;
+  if(tg.textContent !== tgtext) tg.textContent = tgtext;
+  const tk = card.querySelector('.task');
+  const tkv = sess.task || '';
+  if(tk.textContent !== tkv) tk.textContent = tkv;
+  tk.style.display = tkv ? '' : 'none';
+  const fg = card.querySelector('.fg');
+  if(fg.textContent !== sess.fg_process) fg.textContent = sess.fg_process;
+  const pre = card.querySelector('pre');
+  // Only rewrite the terminal text when it actually changed, so we don't stomp
+  // a user's scroll mid-read. Pin-to-bottom if they were already at the bottom.
+  if(pre.textContent !== sess.pane){
+    const atBottom = pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 4;
+    pre.textContent = sess.pane;
+    if(atBottom) pre.scrollTop = pre.scrollHeight;
+  }
+  return card;
+}
+
+// Reconcile a panel to exactly the given ordered list of sessions.
+function syncPanel(panelId, list){
+  const panel = document.getElementById(panelId);
+  const wanted = new Set();
+  if(list.length === 0){
+    panel.innerHTML = '<div class="panel-empty">no ' +
+      (panelId === 'all' ? '' : panelId + ' ') + 'sessions</div>';
+    return;
+  }
+  // Drop the empty-state placeholder if present.
+  const ph = panel.querySelector('.panel-empty');
+  if(ph) ph.remove();
+  list.forEach(sess => {
+    const key = encodeURIComponent(sess.session);
+    wanted.add('card-' + panelId + '-' + key);
+    const card = upsertCard(panel, sess, key);
+    panel.appendChild(card); // moves existing node into order, preserves scroll
+  });
+  // Remove cards for sessions no longer in this panel.
+  Array.from(panel.children).forEach(c => {
+    if(c.id && !wanted.has(c.id)) c.remove();
+  });
+}
+
+function render(data){
+  document.getElementById('meta').innerHTML =
+    'filter <code>' + escapeHtml(data.filter) + '</code> · updated ' +
+    escapeHtml(data.updated) + ' · ' + data.n + ' session(s)';
+  const c = data.counts;
+  document.getElementById('cnt-all').textContent = data.n;
+  document.getElementById('cnt-waiting').textContent = c.waiting;
+  document.getElementById('cnt-stale').textContent = c.stale;
+  document.getElementById('cnt-running').textContent = c.running;
+  document.getElementById('cnt-idle').textContent = c.idle;
+  const by = {WAITING:[], STALE:[], RUNNING:[], IDLE:[], OTHER:[]};
+  data.sessions.forEach(s => (by[s.state] || by.OTHER).push(s));
+  syncPanel('waiting', by.WAITING);
+  syncPanel('stale',   by.STALE);
+  syncPanel('running', by.RUNNING);
+  syncPanel('idle',    by.IDLE);
+  // "all" is attention-ordered.
+  const all = [];
+  ATTENTION.forEach(st => (by[st] || []).forEach(s => all.push(s)));
+  syncPanel('all', all);
+  document.body.classList.remove('stale-conn');
+}
+function escapeHtml(s){ return String(s).replace(/[&<>]/g,
+  m => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[m])); }
+
+async function poll(){
+  try {
+    const r = await fetch('data.json?_=' + Date.now(), {cache:'no-store'});
+    if(r.ok) render(await r.json());
+    else document.body.classList.add('stale-conn');
+  } catch(e){ document.body.classList.add('stale-conn'); }
+}
+poll();
+setInterval(poll, INTERVAL);
+</script>
+</body>
+</html>
 HTMLHEAD
-
-  if [[ $n -eq 0 ]]; then
-    printf '<div class="panel-empty">no sessions match filter <code>%s</code></div>\n' "$filter"
-    printf '</body>\n</html>\n'
-    return
-  fi
-
-  # One panel per status tab. CSS shows only the :target panel; #all is the
-  # default (rendered last so the ~ sibling selector can hide it when another
-  # panel is targeted). Emit the single-status panels first.
-  local pass id count
-  for pass in WAITING STALE RUNNING IDLE; do
-    case "$pass" in
-      WAITING) id=waiting; count=$c_waiting ;;
-      STALE)   id=stale;   count=$c_stale ;;
-      RUNNING) id=running; count=$c_running ;;
-      IDLE)    id=idle;    count=$c_idle ;;
-    esac
-    printf '<section class="panel" id="%s">\n' "$id"
-    if [[ $count -eq 0 ]]; then
-      printf '  <div class="panel-empty">no %s sessions</div>\n' "$id"
-    else
-      for ((i=0; i<n; i++)); do
-        [[ "${rows_state[i]}" == "$pass" ]] || continue
-        _serve_emit_card "$i"
-      done
-    fi
-    printf '</section>\n'
-  done
-
-  # The default "all" panel — attention-first: WAITING, STALE, RUNNING, IDLE,
-  # then anything else. Placed LAST so `.panel:target ~ #all` can hide it.
-  printf '<section class="panel" id="all">\n'
-  for pass in WAITING STALE RUNNING IDLE OTHER; do
-    for ((i=0; i<n; i++)); do
-      local order="${rows_state[i]}"
-      case "$pass" in
-        OTHER) [[ "$order" =~ ^(WAITING|STALE|RUNNING|IDLE)$ ]] && continue ;;
-        *)     [[ "$order" != "$pass" ]] && continue ;;
-      esac
-      _serve_emit_card "$i"
-    done
-  done
-  printf '</section>\n'
-
-  printf '</body>\n</html>\n'
 }
 
 cmd_serve() {
   have_tmux
   need python3
+  need jq
   local filter='*' interval=3 port=8787 lines=40
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -609,11 +666,17 @@ cmd_serve() {
   # else. Cleaned up on exit.
   local webdir; webdir=$(mktemp -d "$STATE_DIR/serve.XXXXXX") || die "cannot create temp dir"
 
-  # Background refresher: regenerate index.html every $interval seconds.
+  # The shell is static: write it once. Live state flows through data.json.
+  _serve_render_shell "$filter" "$interval" > "$webdir/index.html"
+  # Seed the first data.json so the initial paint has data, not "connecting…".
+  _serve_render_json "$filter" "$lines" > "$webdir/data.json" 2>/dev/null
+
+  # Background refresher: regenerate data.json every $interval seconds. The
+  # browser polls it and updates cards in place (no page reload).
   ( while true; do
-      _serve_render_html "$filter" "$interval" "$lines" > "$webdir/index.html.tmp" 2>/dev/null
-      mv -f "$webdir/index.html.tmp" "$webdir/index.html"
       sleep "$interval"
+      _serve_render_json "$filter" "$lines" > "$webdir/data.json.tmp" 2>/dev/null
+      mv -f "$webdir/data.json.tmp" "$webdir/data.json"
     done ) &
   local refresher=$!
 
