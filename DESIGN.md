@@ -104,13 +104,15 @@ Everything else depends on this; it ships first.
 The v0.2 WAITING/IDLE heuristic keys on **shell** prompts — useless for "did the
 Claude agent finish its turn." Add **per-type ready-patterns** in the registry:
 
-- `claude` — its prompt glyph / the "esc to interrupt" indicator disappearing.
+- `claude` — **sentinel echo** `<<<TMT_READY:{session}>>>` printed at the end of
+  each turn (see §11.2). Unambiguous; the primary mechanism.
 - `aider` — the `>` prompt returning.
 - `shell` — existing behavior.
 - `build` — process exit (fg returns to shell).
 
-`tmt ask` polls until: output hash stable for `--quiescent` seconds **and** the
-ready-pattern matches the tail. Falls back to `--timeout` with exit `7`.
+`tmt ask` polls until the session's ready-pattern matches the pane tail (for
+`claude`, the sentinel line). Output-quiescence (`--quiescent` seconds of no
+change) is a secondary backstop; hard `--timeout` yields exit `7`.
 
 ## 7. Safety layer (gates autonomy — built before auto-response turns on)
 
@@ -164,13 +166,29 @@ Ship A→B→C→D so autonomy is impossible before locking and audit exist.
 - Reviving process memory across reboot (impossible; we recreate + relaunch).
 - Multi-pane split-layout revival (session-level restore only).
 - Competing with native Claude subagents for ephemeral, same-context fan-out.
+- A pending-task queue / cross-task scheduler (deferred; see §11.3).
 
-## 11. Open questions
+## 11. Resolved decisions
 
-- Policy format: YAML (needs a parser dep) vs. simple line-based `.conf` (pure
-  bash, no dep)? Leaning `.conf` to keep `tmt` dependency-light.
-- Ready-pattern for Claude sessions: detect via the pane glyph, or have the
-  orchestrator inject a sentinel echo after each turn? Sentinel is more robust
-  but requires cooperation from the launched agent.
-- Should `dispatch` support a pending-task **queue** (assign backlog to freed
-  sessions), or is one-task-per-explicit-dispatch enough for now?
+1. **Policy format: line-based `.conf`** (pure bash, no dependency). Lives at
+   `~/.config/tmux-tasks/policy.conf`. Grammar:
+   ```
+   # comment
+   allow:    <regex>      # orchestrator MAY auto-answer prompts matching this
+   escalate: <regex>      # ALWAYS route to the human (checked first, wins)
+   # a prompt matching neither -> escalate (default-deny)
+   ```
+   `escalate:` rules are evaluated before `allow:` so a destructive pattern can
+   never be auto-answered even if a broad `allow:` would match it.
+
+2. **Claude readiness: sentinel echo.** `dispatch` launches each agent so every
+   turn ends by printing a unique marker `<<<TMT_READY:{session}>>>`. `tmt ask`
+   polls `capture-pane` until that marker appears in the tail — unambiguous and
+   robust to TUI/version changes. Registry stores the marker per session.
+   (Quiescence remains a `--timeout` backstop, exit `7`.) The `ready_pattern`
+   field in §6 is therefore the sentinel string, not a glyph heuristic, for
+   `claude`-type sessions.
+
+3. **No task queue yet.** Each `tmt dispatch` creates exactly one task now.
+   Explicit-dispatch only; a draining backlog/concurrency-cap queue is deferred
+   until real demand appears (moved to Non-goals for the current phase).
