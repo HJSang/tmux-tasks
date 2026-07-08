@@ -42,7 +42,7 @@
 
 set -uo pipefail
 
-TMT_VERSION="0.3.3"
+TMT_VERSION="0.3.4"
 
 # Stable exit codes (see DESIGN.md §5) so a program consumer can branch on them.
 EX_OK=0; EX_USAGE=2; EX_NOSESSION=3; EX_LOCKED=4; EX_POLICY=5; EX_NOTMUX=6; EX_TIMEOUT=7
@@ -571,11 +571,15 @@ function upsertCard(panel, sess, key){
   if(fg.textContent !== sess.fg_process) fg.textContent = sess.fg_process;
   const pre = card.querySelector('pre');
   // Only rewrite the terminal text when it actually changed, so we don't stomp
-  // a user's scroll mid-read. Pin-to-bottom if they were already at the bottom.
+  // a user's scroll mid-read. Setting textContent resets scrollTop to 0, so we
+  // capture the position first and restore it: if they were pinned to the
+  // bottom, keep following new output; otherwise leave their scroll exactly
+  // where it was so they can read at their own pace.
   if(pre.textContent !== sess.pane){
-    const atBottom = pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 4;
+    const prevTop = pre.scrollTop;
+    const atBottom = prevTop + pre.clientHeight >= pre.scrollHeight - 4;
     pre.textContent = sess.pane;
-    if(atBottom) pre.scrollTop = pre.scrollHeight;
+    pre.scrollTop = atBottom ? pre.scrollHeight : prevTop;
   }
   return card;
 }
