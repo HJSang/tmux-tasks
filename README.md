@@ -113,7 +113,17 @@ tmt dispatch task/auth-rewrite --type claude --isolation worktree \
 
 Worktree tasks get a dedicated `git worktree` under `<repo>/../tmt-worktrees/<branch>`, so multiple long-lived agents on one repo can't corrupt each other's tree.
 
-Not yet shipped: `tmt ask` (send-and-await-reply), the auto-response policy layer, and the `tmt-orchestrate` skill. See `DESIGN.md` phases B–D.
+Not yet shipped: `tmt ask` (send-and-await-reply) and the auto-response policy layer. See `DESIGN.md` phases B–D.
+
+### Claude Code skill
+
+A skill in [`skills/tmt/`](skills/tmt/SKILL.md) teaches a Claude Code session to act as the supervisor: read the fleet, summarize what needs attention, launch isolated tasks with `dispatch`, and — with explicit per-input approval — answer a prompt in a session. Install it (symlinks the repo copy so edits stay live):
+
+```bash
+make install-skill      # -> ~/.claude/skills/tmt
+```
+
+Then in Claude Code, ask things like "check my tasks", "what's blocked", or "start a task in ~/code/app". The skill deliberately requires your approval for every `send`/`key` until the Phase C policy+audit layer exists, and never auto-answers destructive prompts.
 
 ## License
 

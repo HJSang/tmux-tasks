@@ -7,8 +7,10 @@ PREFIX ?= $(HOME)/.local
 BINDIR  = $(PREFIX)/bin
 # bash-completion.d location differs; this is the common user path.
 COMPDIR = $(PREFIX)/share/bash-completion/completions
+# Claude Code personal skills dir (for the orchestration skill).
+SKILLDIR = $(HOME)/.claude/skills
 
-.PHONY: all install uninstall lint test help
+.PHONY: all install uninstall install-skill uninstall-skill lint test help
 
 all: help
 
@@ -25,6 +27,17 @@ uninstall:
 	@rm -f "$(BINDIR)/tmt" "$(COMPDIR)/tmt"
 	@echo "removed tmt from $(BINDIR)"
 
+# Install the Claude Code orchestration skill by symlinking the repo copy, so
+# edits to skills/tmt/SKILL.md stay live without reinstalling.
+install-skill:
+	@mkdir -p "$(SKILLDIR)"
+	@ln -sfn "$(CURDIR)/skills/tmt" "$(SKILLDIR)/tmt"
+	@echo "linked skill -> $(SKILLDIR)/tmt (restart Claude Code or open /skills to pick it up)"
+
+uninstall-skill:
+	@rm -f "$(SKILLDIR)/tmt"
+	@echo "removed skill from $(SKILLDIR)"
+
 lint:
 	@command -v shellcheck >/dev/null && shellcheck bin/tmt || echo "shellcheck not installed; skipping"
 
@@ -33,7 +46,9 @@ test:
 
 help:
 	@echo "targets:"
-	@echo "  make install    [PREFIX=~/.local]   install tmt + completion"
-	@echo "  make uninstall  [PREFIX=~/.local]   remove tmt"
-	@echo "  make lint                            run shellcheck"
-	@echo "  make test                            run the smoke test"
+	@echo "  make install        [PREFIX=~/.local]   install tmt + completion"
+	@echo "  make uninstall      [PREFIX=~/.local]   remove tmt"
+	@echo "  make install-skill                       link Claude Code skill"
+	@echo "  make uninstall-skill                     unlink Claude Code skill"
+	@echo "  make lint                                run shellcheck"
+	@echo "  make test                                run the smoke test"
