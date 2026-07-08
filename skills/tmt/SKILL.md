@@ -73,10 +73,15 @@ When a session is WAITING and the user asks you to respond:
 2. Propose the precise input you would send.
 3. **Get explicit approval for that specific input**, then:
    ```bash
-   tmt send SESSION -- 'the approved text'   # Enter is appended
+   tmt send SESSION -- 'the approved text'   # types text, then submits Enter
    tmt key  SESSION C-c                        # for control keys
    ```
-4. Re-`capture` to confirm the prompt was accepted; report the result.
+   `send` splits the text and Enter into two keystrokes with a settle delay so
+   TUI agents (Claude, aider) actually submit. If a submit doesn't register in
+   a slow/heavy TUI, retry with a longer delay: `TMT_SEND_DELAY=0.8 tmt send ...`.
+4. Re-`capture` to confirm the prompt was accepted; report the result. If the
+   text is in the input box but wasn't submitted, send Enter alone:
+   `tmt key SESSION Enter`.
 
 Hard rules until the Phase C policy+audit layer exists:
 - **Never** send input without showing the prompt and getting approval for the

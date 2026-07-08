@@ -92,6 +92,15 @@ sleep 0.5
 wcwd=$(tmux display-message -t "$P/wt" -p '#{pane_current_path}' 2>/dev/null)
 [[ "$wcwd" == *tmt-worktrees/b1 ]] && ok "worktree session cwd is the worktree" || bad "worktree cwd: '$wcwd'"
 
+# send splits text + Enter and actually submits (Enter registers)
+tmux new-session -d -s "$P/sub" -c /tmp
+tmux send-keys -t "$P/sub" 'read l; echo "GOT:[$l]"' Enter
+sleep 0.8
+"$TMT" send "$P/sub" -- 'submit-me' >/dev/null
+sleep 1
+tmux capture-pane -t "$P/sub" -p | grep -q 'GOT:\[submit-me\]' && ok "send submits (Enter registers)" || bad "send: Enter not registered"
+tmux kill-session -t "$P/sub" 2>/dev/null
+
 # cleanup phase A
 tmux kill-session -t "$P/disp" 2>/dev/null; tmux kill-session -t "$P/wt" 2>/dev/null
 rm -f "$regdir/${P//\//_}"*.json

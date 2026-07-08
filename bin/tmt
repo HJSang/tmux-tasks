@@ -40,7 +40,7 @@
 
 set -uo pipefail
 
-TMT_VERSION="0.3.0"
+TMT_VERSION="0.3.1"
 
 # Stable exit codes (see DESIGN.md §5) so a program consumer can branch on them.
 EX_OK=0; EX_USAGE=2; EX_NOSESSION=3; EX_LOCKED=4; EX_POLICY=5; EX_NOTMUX=6; EX_TIMEOUT=7
@@ -193,13 +193,31 @@ cmd_capture() {
   tmux capture-pane -t "$sess" -p -S "-$lines" 2>/dev/null
 }
 
+# Type a line into a session and submit it. Sends the TEXT and the Enter as
+# TWO separate send-keys calls with a short settle delay between them.
+#
+# Why not one call: TUI apps (Claude Code, aider, ...) ingest a paste
+# char-by-char or via bracketed-paste. When text + Enter arrive in one burst,
+# the Enter is absorbed into the input box (as a literal newline, or before the
+# app finishes reading the paste) instead of submitting. Splitting them — and
+# waiting for the app to settle — makes the submit reliable. Plain shells are
+# unaffected either way. Delay overridable via TMT_SEND_DELAY (seconds).
+_send_line() {
+  local sess="$1" text="$2"
+  local delay="${TMT_SEND_DELAY:-0.3}"
+  tmux send-keys -t "$sess" -- "$text" || return 1
+  # Let the target ingest the text before we submit.
+  sleep "$delay"
+  tmux send-keys -t "$sess" Enter
+}
+
 cmd_send() {
   have_tmux
   local sess="${1:?usage: tmt send SESSION -- TEXT}"; shift
   tmux has-session -t "$sess" 2>/dev/null || die "$EX_NOSESSION" "no such session: $sess"
   [[ "${1:-}" == "--" ]] && shift
   local text="$*"
-  tmux send-keys -t "$sess" -- "$text" Enter && \
+  _send_line "$sess" "$text" && \
     printf '%s→ sent to %s:%s %s\n' "$c_grn" "$sess" "$c_reset" "$text"
 }
 
@@ -220,7 +238,7 @@ cmd_new() {
   tmux new-session -d -s "$name" || die "failed to create session: $name"
   if [[ "${1:-}" == "--" ]]; then
     shift
-    tmux send-keys -t "$name" -- "$*" Enter
+    _send_line "$name" "$*"
   fi
   printf '%s✓ created session%s %s\n' "$c_grn" "$c_reset" "$name"
 }
@@ -330,7 +348,7 @@ cmd_dispatch() {
   reg_write "$name" "$type" "$opening" "$iso" "$location" "$branch" "$ready"
 
   # Launch the opening command / agent.
-  [[ -n "$opening" ]] && tmux send-keys -t "$name" -- "$opening" Enter
+  [[ -n "$opening" ]] && _send_line "$name" "$opening"
 
   printf '%s✓ dispatched%s %s  type=%s iso=%s\n  location: %s%s\n' \
     "$c_grn" "$c_reset" "$name" "$type" "$iso" "$location" \
@@ -500,7 +518,7 @@ cmd_restore() {
       skipped=$((skipped+1)); continue
     fi
     tmux new-session -d -s "$sess" -c "$cwd" 2>/dev/null && created=$((created+1))
-    [[ -n "$fg" && $run -eq 1 ]] && tmux send-keys -t "$sess" -- "$fg" Enter
+    [[ -n "$fg" && $run -eq 1 ]] && _send_line "$sess" "$fg"
   done < "$file"
 
   if [[ $dry -eq 1 ]]; then
@@ -567,7 +585,7 @@ _interactive_send() {
   printf 'text to send (Enter appended): '; local text; read -r text
   printf 'send %s"%s"%s to %s? [y/N] ' "$c_yel" "$text" "$c_reset" "$sess"
   local ok; read -r ok
-  [[ "$ok" == y || "$ok" == Y ]] && tmux send-keys -t "$sess" -- "$text" Enter && { printf 'sent.\n'; sleep 0.6; }
+  [[ "$ok" == y || "$ok" == Y ]] && _send_line "$sess" "$text" && { printf 'sent.\n'; sleep 0.6; }
 }
 
 _interactive_key() {
