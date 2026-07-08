@@ -101,6 +101,26 @@ sleep 1
 tmux capture-pane -t "$P/sub" -p | grep -q 'GOT:\[submit-me\]' && ok "send submits (Enter registers)" || bad "send: Enter not registered"
 tmux kill-session -t "$P/sub" 2>/dev/null
 
+# serve renders a per-status tabbed dashboard (needs python3 + curl)
+if command -v python3 >/dev/null && command -v curl >/dev/null; then
+  tmux new-session -d -s "$P/srun" -c /tmp; tmux send-keys -t "$P/srun" 'sleep 60' Enter
+  tmux new-session -d -s "$P/swait" -c /tmp; tmux send-keys -t "$P/swait" 'read "a?go? (y/n) "' Enter
+  sleep 1
+  sport=8791
+  "$TMT" serve --filter "$P/s*" --port "$sport" --interval 2 --lines 8 >/dev/null 2>&1 &
+  spid=$!
+  sleep 2
+  shtml=$(curl -s "http://127.0.0.1:$sport/" 2>/dev/null)
+  kill "$spid" 2>/dev/null; wait "$spid" 2>/dev/null
+  ntabs=$(printf '%s' "$shtml" | grep -oE 'href="#(all|waiting|stale|running|idle)"' | sort -u | wc -l)
+  [[ "$ntabs" -eq 5 ]] && ok "serve renders 5 status tabs" || bad "serve tabs: got $ntabs"
+  printf '%s' "$shtml" | awk '/id="waiting"/,/<\/section>/' | grep -q "$P/swait" \
+    && ok "serve groups session into its status panel" || bad "serve: wait session not in waiting panel"
+  tmux kill-session -t "$P/srun" 2>/dev/null; tmux kill-session -t "$P/swait" 2>/dev/null
+else
+  echo "skip serve test (python3/curl missing)"
+fi
+
 # cleanup phase A
 tmux kill-session -t "$P/disp" 2>/dev/null; tmux kill-session -t "$P/wt" 2>/dev/null
 rm -f "$regdir/${P//\//_}"*.json

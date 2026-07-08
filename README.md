@@ -85,7 +85,9 @@ tmt serve --filter 'task/*' --interval 2 --port 9000
 tmt serve --lines 80                             # show more pane scrollback per card
 ```
 
-One card per session, **attention-first** (WAITING and STALE at the top, then RUNNING, then IDLE), each with a colored state dot, the foreground process, and the recent terminal output. The page carries a `<meta refresh>` matching `--interval`, so it needs **zero client-side JavaScript**.
+The page is **organized by status into tabs** — `all`, `waiting`, `stale`, `running`, `idle` — with a live count on each. Click a tab to see just those sessions; the `all` tab stays attention-first (WAITING and STALE on top, then RUNNING, then IDLE). Each card shows a colored state dot, the foreground process, and recent terminal output.
+
+Tabs use CSS `:target` (anchor links like `#waiting`), so the selected tab **persists across the auto-refresh** and the whole page still needs **zero client-side JavaScript** — the `<meta refresh>` matching `--interval` reloads it, and the URL fragment keeps you on your chosen tab.
 
 It's **read-only** — the dashboard only displays state; it never sends input. The server binds to `127.0.0.1` only (panes can contain secrets, so nothing is exposed on the network), regenerates the page in a private temp dir, and cleans up on `Ctrl-C`. Requires `python3` (for the built-in `http.server`).
 

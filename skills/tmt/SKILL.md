@@ -26,8 +26,9 @@ an auto-response policy engine, `tmt reply`, `tmt audit`. Until those exist,
 
 ## Reading the fleet (do this first)
 
-Always start from structured state, not the TUI (never launch `tmt watch` — it
-is an interactive loop for humans and will hang you):
+Always start from structured state, not a long-running UI. **Never launch
+`tmt watch` or `tmt serve` yourself** — both block forever (an interactive TUI
+and an HTTP server) and will hang your turn. Use the one-shot commands:
 
 ```bash
 tmt agent-scan --json            # all sessions: state, type, task, isolation, pane_tail
@@ -36,6 +37,11 @@ tmt registry                     # per-task metadata (type, isolation, branch, r
 tmt status SESSION               # human-readable detail + last 25 lines
 tmt capture SESSION --lines 200  # more scrollback when you need context
 ```
+
+If the **user** wants to watch the fleet themselves, point them at the
+status-tabbed browser dashboard — tell them to run it in their own terminal,
+don't run it for them: `tmt serve` (opens http://127.0.0.1:8787/, tabs for
+all/waiting/stale/running/idle, auto-refreshing, read-only).
 
 State field meanings:
 - `RUNNING` — a non-shell process is working; output moving.
