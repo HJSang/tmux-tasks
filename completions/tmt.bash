@@ -3,7 +3,7 @@ _tmt() {
   local cur prev subcmds
   cur="${COMP_WORDS[COMP_CWORD]}"
   prev="${COMP_WORDS[COMP_CWORD-1]}"
-  subcmds="watch ls status capture send key new dispatch registry save restore snapshots agent-scan attach version help"
+  subcmds="watch ls status capture send key new dispatch registry save restore snapshots agent-scan serve attach version help"
 
   # complete the subcommand itself
   if [[ $COMP_CWORD -eq 1 ]]; then
@@ -23,6 +23,10 @@ _tmt() {
       ;;
     watch|ls|agent-scan)
       [[ "$cur" == -* ]] && mapfile -t COMPREPLY < <(compgen -W "--filter --interval --json" -- "$cur")
+      return
+      ;;
+    serve)
+      [[ "$cur" == -* ]] && mapfile -t COMPREPLY < <(compgen -W "--filter --interval --port --lines" -- "$cur")
       return
       ;;
     save)

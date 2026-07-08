@@ -23,6 +23,8 @@
 #   restore [SNAPSHOT] [--run] [--dry-run]  Recreate sessions from a snapshot
 #   snapshots                               List saved snapshots
 #   agent-scan [--filter GLOB] [--json]     Digest of all sessions for an agent
+#   serve [--filter GLOB] [--interval N] [--port P] [--lines N]
+#                                           Live HTML dashboard (localhost, auto-refresh)
 #   attach SESSION                          Attach to a session (exits monitor)
 #   version                                 Print version
 #
@@ -398,6 +400,193 @@ cmd_agent_scan() {
   fi
 }
 
+# --- serve: live HTML dashboard -------------------------------------------
+#
+# Regenerates a static index.html from the same scan data agent-scan uses, then
+# serves the directory with `python3 -m http.server`. The page carries a
+# <meta http-equiv="refresh"> matching the poll interval, so a browser shows
+# near-real-time state with zero client JS. Read-only: it never sends input.
+#
+# Bound to 127.0.0.1 only — panes can contain secrets, so we never expose them
+# on the network.
+
+# HTML-escape stdin (&, <, > only — enough for text nodes / <pre>).
+_html_escape() { sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'; }
+
+# Map a state to a CSS class name (reused as color keys in the page's <style>).
+_serve_state_class() {
+  case "$1" in
+    RUNNING) printf 'running' ;; WAITING) printf 'waiting' ;;
+    STALE)   printf 'stale' ;;   IDLE)    printf 'idle' ;;
+    *)       printf 'unknown' ;;
+  esac
+}
+
+# Write one complete dashboard HTML document to stdout.
+# Args: filter interval lines
+_serve_render_html() {
+  local filter="$1" interval="$2" lines="$3"
+  local now; now=$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null || date)
+
+  # Gather rows first so we can show a summary count in the header. detect()
+  # mutates per-session hash state, so call it exactly once per session here.
+  local -a rows_sess rows_state rows_cmd rows_task rows_pane
+  local n=0
+  local sess line st rest cmd task pane
+  while IFS= read -r sess; do
+    [[ -z "$sess" ]] && continue
+    line=$(detect "$sess")
+    st=${line%%$'\t'*}; rest=${line#*$'\t'}; cmd=${rest%%$'\t'*}
+    task=$(reg_get "$sess" task)
+    pane=$(tmux capture-pane -t "$sess" -p -S "-$lines" 2>/dev/null)
+    rows_sess[n]="$sess"; rows_state[n]="$st"; rows_cmd[n]="$cmd"
+    rows_task[n]="$task"; rows_pane[n]="$pane"
+    n=$((n+1))
+  done < <(list_sessions "$filter")
+
+  # Per-state counts for the header badges.
+  local c_running=0 c_waiting=0 c_stale=0 c_idle=0 i
+  for ((i=0; i<n; i++)); do
+    case "${rows_state[i]}" in
+      RUNNING) c_running=$((c_running+1)) ;;
+      WAITING) c_waiting=$((c_waiting+1)) ;;
+      STALE)   c_stale=$((c_stale+1)) ;;
+      IDLE)    c_idle=$((c_idle+1)) ;;
+    esac
+  done
+
+  cat <<HTMLHEAD
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="refresh" content="$interval">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>tmt dashboard</title>
+<style>
+  :root { color-scheme: light dark; }
+  * { box-sizing: border-box; }
+  body { font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+         margin: 0; padding: 1.2rem; background: #0b0f14; color: #d7dde3; }
+  h1 { font-size: 1.1rem; margin: 0 0 .2rem; }
+  .meta { color: #7d8794; font-size: .82rem; margin-bottom: 1rem; }
+  .badges { display: flex; gap: .5rem; flex-wrap: wrap; margin-bottom: 1rem; }
+  .badge { padding: .15rem .55rem; border-radius: 999px; font-size: .78rem;
+           border: 1px solid #263040; }
+  .card { border: 1px solid #263040; border-radius: 8px; margin-bottom: 1rem;
+          overflow: hidden; background: #0f151d; }
+  .card > header { display: flex; align-items: center; gap: .6rem;
+                   padding: .55rem .8rem; background: #141c26; }
+  .dot { width: .7rem; height: .7rem; border-radius: 50%; flex: 0 0 auto; }
+  .name { font-weight: 700; }
+  .fg { color: #7d8794; font-size: .8rem; margin-left: auto; }
+  .task { color: #9aa4b0; font-size: .8rem; }
+  .state-tag { font-size: .72rem; padding: .05rem .45rem; border-radius: 4px;
+               border: 1px solid currentColor; }
+  pre { margin: 0; padding: .7rem .8rem; overflow-x: auto; white-space: pre-wrap;
+        word-break: break-word; max-height: 22rem; overflow-y: auto;
+        font-size: .8rem; color: #c2cad3; }
+  .running { color: #4ade80; } .waiting { color: #fbbf24; }
+  .stale   { color: #f87171; } .idle    { color: #6b7480; }
+  .unknown { color: #9aa4b0; }
+  .dot.running { background:#4ade80; } .dot.waiting { background:#fbbf24; }
+  .dot.stale   { background:#f87171; } .dot.idle    { background:#6b7480; }
+  .dot.unknown { background:#9aa4b0; }
+  .empty { color: #7d8794; padding: 2rem; text-align: center; }
+</style>
+</head>
+<body>
+<h1>tmt — live session dashboard</h1>
+<div class="meta">filter <code>$filter</code> · refresh ${interval}s · updated $now · $n session(s)</div>
+<div class="badges">
+  <span class="badge running">▶ $c_running running</span>
+  <span class="badge waiting">⏳ $c_waiting waiting</span>
+  <span class="badge stale">■ $c_stale stale</span>
+  <span class="badge idle">· $c_idle idle</span>
+</div>
+HTMLHEAD
+
+  if [[ $n -eq 0 ]]; then
+    printf '<div class="empty">no sessions match filter <code>%s</code></div>\n' "$filter"
+  fi
+
+  # WAITING and STALE first (they want attention), then RUNNING, then IDLE.
+  local order pass
+  for pass in WAITING STALE RUNNING IDLE OTHER; do
+    for ((i=0; i<n; i++)); do
+      order="${rows_state[i]}"
+      case "$pass" in
+        OTHER) [[ "$order" =~ ^(WAITING|STALE|RUNNING|IDLE)$ ]] && continue ;;
+        *)     [[ "$order" != "$pass" ]] && continue ;;
+      esac
+      local klass; klass=$(_serve_state_class "${rows_state[i]}")
+      local esc_sess esc_cmd esc_task esc_pane
+      esc_sess=$(printf '%s' "${rows_sess[i]}" | _html_escape)
+      esc_cmd=$(printf '%s'  "${rows_cmd[i]}"  | _html_escape)
+      esc_task=$(printf '%s' "${rows_task[i]}" | _html_escape)
+      esc_pane=$(printf '%s' "${rows_pane[i]}" | _html_escape)
+      printf '<div class="card">\n'
+      printf '  <header>\n'
+      printf '    <span class="dot %s"></span>\n' "$klass"
+      printf '    <span class="name">%s</span>\n' "$esc_sess"
+      printf '    <span class="state-tag %s">%s</span>\n' "$klass" "${rows_state[i]}"
+      [[ -n "$esc_task" ]] && printf '    <span class="task">%s</span>\n' "$esc_task"
+      printf '    <span class="fg">%s</span>\n' "$esc_cmd"
+      printf '  </header>\n'
+      printf '  <pre>%s</pre>\n' "$esc_pane"
+      printf '</div>\n'
+    done
+  done
+
+  printf '</body>\n</html>\n'
+}
+
+cmd_serve() {
+  have_tmux
+  need python3
+  local filter='*' interval=3 port=8787 lines=40
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --filter)   filter="$2"; shift 2 ;;
+      --interval) interval="$2"; shift 2 ;;
+      --port)     port="$2"; shift 2 ;;
+      --lines)    lines="$2"; shift 2 ;;
+      *) die "serve: unknown option: $1" ;;
+    esac
+  done
+  [[ "$interval" =~ ^[0-9]+$ && "$interval" -ge 1 ]] || die "serve: --interval must be a positive integer"
+  [[ "$port" =~ ^[0-9]+$ ]] || die "serve: --port must be a number"
+  [[ "$lines" =~ ^[0-9]+$ ]] || die "serve: --lines must be a number"
+
+  # Serve out of a private temp dir so the http.server can't expose anything
+  # else. Cleaned up on exit.
+  local webdir; webdir=$(mktemp -d "$STATE_DIR/serve.XXXXXX") || die "cannot create temp dir"
+
+  # Background refresher: regenerate index.html every $interval seconds.
+  ( while true; do
+      _serve_render_html "$filter" "$interval" "$lines" > "$webdir/index.html.tmp" 2>/dev/null
+      mv -f "$webdir/index.html.tmp" "$webdir/index.html"
+      sleep "$interval"
+    done ) &
+  local refresher=$!
+
+  printf '%s✓ dashboard%s http://127.0.0.1:%s/  (filter=%s refresh=%ss)\n' \
+    "$c_grn" "$c_reset" "$port" "$filter" "$interval"
+  printf '%sread-only; Ctrl-C to stop%s\n' "$c_dim" "$c_reset"
+
+  # Start the server (bind localhost only) as a tracked child so we can kill it
+  # on any exit path — not just interactive Ctrl-C, which would hit the whole
+  # process group anyway.
+  ( cd "$webdir" && exec python3 -m http.server "$port" --bind 127.0.0.1 ) 2>/dev/null &
+  local server=$!
+
+  # Clean up both children and the temp dir however we exit.
+  trap 'kill "$refresher" "$server" 2>/dev/null; rm -rf "$webdir"' EXIT INT TERM
+
+  # Block until the server exits (Ctrl-C, or the port dies).
+  wait "$server"
+}
+
 # --- save / restore -------------------------------------------------------
 #
 # A snapshot is a tab-separated file, one line per pane:
@@ -628,6 +817,7 @@ main() {
     restore)     cmd_restore "$@" ;;
     snapshots)   cmd_snapshots "$@" ;;
     agent-scan)  cmd_agent_scan "$@" ;;
+    serve)       cmd_serve "$@" ;;
     attach)      cmd_attach "$@" ;;
     version|--version|-V) printf 'tmt (tmux-tasks) %s\n' "$TMT_VERSION" ;;
     -h|--help|help) usage ;;
