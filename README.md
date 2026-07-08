@@ -44,6 +44,34 @@ tmt new  task/2026-07-08/auth-fix -- 'aider .'   # create a task session
 tmt attach task/auth-fix
 ```
 
+## Surviving reboots (save / restore)
+
+A reboot kills every process, so **no tool can revive a running build or a live agent** — tmux sessions are just processes. What `tmt` (like tmux-resurrect) does is snapshot the session *layout* — session name, working directory, and the foreground command — and recreate it afterward.
+
+```bash
+tmt save                       # snapshot all sessions
+tmt save --filter 'task/*' --name work
+tmt snapshots                  # list saved snapshots
+tmt restore --dry-run          # preview what the latest snapshot would recreate
+tmt restore                    # recreate the sessions (shells only)
+tmt restore --run              # recreate AND re-launch the captured commands
+tmt restore work-20260708-163011.tsv --run   # restore a specific snapshot
+```
+
+Snapshots are stored in `~/.local/share/tmux-tasks/snapshots/` — a **persistent** location, deliberately not `/tmp` (which many systems wipe on the very reboot you're guarding against). The last 20 snapshots are kept; `latest.tsv` always points at the newest.
+
+**Automate it** so you never forget to save, and sessions come back after every reboot:
+
+```bash
+# 1. periodic autosave (cron) — snapshot every 15 min
+*/15 * * * * $HOME/.local/bin/tmt save --filter 'task/*' --name auto >/dev/null 2>&1
+
+# 2. restore on login — add to ~/.bashrc or ~/.zshrc
+tmt restore --run 2>/dev/null   # recreates sessions from the latest snapshot
+```
+
+Restore is session-level (one tmux session per task, matching how `tmt` is used) and skips sessions that already exist, so re-running it is safe. Full multi-pane layout revival is out of scope.
+
 In `watch`, single-key actions: `#` attach, `s` send-input (with confirm), `k` raw key, `c` capture, `r` refresh, `q` quit.
 
 ### States

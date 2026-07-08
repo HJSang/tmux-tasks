@@ -16,9 +16,18 @@
 #   send  SESSION -- TEXT...                Send a line of input to a session
 #   key   SESSION KEY...                    Send raw tmux keys (e.g. Enter, C-c, y)
 #   new   NAME [-- CMD...]                   Create a task session (optionally run CMD)
+#   save  [--filter GLOB] [--name NAME]     Snapshot session layout+cwd+cmd to disk
+#   restore [SNAPSHOT] [--run] [--dry-run]  Recreate sessions from a snapshot
+#   snapshots                               List saved snapshots
 #   agent-scan [--filter GLOB] [--json]     Digest of all sessions for an agent
 #   attach SESSION                          Attach to a session (exits monitor)
 #   version                                 Print version
+#
+# Reboot safety: a reboot kills every process, so no tool can revive a running
+# build or a live agent. `tmt save` snapshots the session *layout* (name, cwd,
+# and the foreground command). After reboot, `tmt restore --run` recreates the
+# sessions and re-launches those commands. Snapshots live in
+# ~/.local/share/tmux-tasks/ (persistent, not /tmp).
 #
 # State detection (mixed CLI tools):
 #   RUNNING  a non-shell process is foreground and output is moving
@@ -28,10 +37,17 @@
 
 set -uo pipefail
 
-TMT_VERSION="0.1.0"
+TMT_VERSION="0.2.0"
 
+# Ephemeral scan state (pane hashes for RUNNING vs STALE). OK to lose on reboot.
 STATE_DIR="${TMPDIR:-/tmp}/tmux-tasks-${USER:-$(id -un)}"
 mkdir -p "$STATE_DIR"
+
+# Persistent snapshots for save/restore. MUST NOT be under /tmp — that is
+# often wiped on reboot, which is the exact event we protect against.
+SNAP_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/tmux-tasks/snapshots"
+mkdir -p "$SNAP_DIR"
+SNAP_KEEP=20   # how many timestamped snapshots to retain
 
 SHELLS='^(bash|zsh|sh|fish|dash|tcsh|ksh|-bash|-zsh)$'
 
@@ -229,6 +245,138 @@ cmd_agent_scan() {
   fi
 }
 
+# --- save / restore -------------------------------------------------------
+#
+# A snapshot is a tab-separated file, one line per pane:
+#   session <TAB> window_index <TAB> window_name <TAB> pane_index <TAB>
+#   window_layout <TAB> cwd <TAB> foreground_command
+# Comment lines (#) carry metadata. This mirrors what tmux-resurrect stores:
+# it recreates the session *layout* and re-runs the foreground command; it
+# cannot revive process memory (nothing can, across a reboot).
+
+# Return the foreground command line for a pane's tty (empty if just a shell).
+_pane_fg_cmd() {
+  local tty="${1#/dev/}"
+  # stat with '+' = foreground process group; skip the login shell itself.
+  ps -t "$tty" -o stat=,args= 2>/dev/null | awk '
+    $1 ~ /\+/ {
+      cmd=$0; sub(/^[[:space:]]*[^[:space:]]+[[:space:]]+/, "", cmd)   # drop stat col
+      if (cmd ~ /^-?(bash|zsh|sh|fish|dash|tcsh|ksh)$/) next            # bare shell
+      print cmd; exit
+    }'
+}
+
+# Escape a field for our TSV (newlines/tabs would corrupt the format).
+_tsv() { printf '%s' "$1" | tr '\n\t' '  '; }
+
+cmd_save() {
+  have_tmux
+  local filter='*' name=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --filter) filter="$2"; shift 2 ;;
+      --name)   name="$2"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+  local stamp file
+  stamp=$(date +%Y%m%d-%H%M%S)
+  file="$SNAP_DIR/${name:-snapshot}-$stamp.tsv"
+
+  {
+    printf '# tmux-tasks snapshot v1\n'
+    printf '# created %s  filter %s  host %s\n' "$(date -Iseconds 2>/dev/null || date)" "$filter" "$(hostname 2>/dev/null)"
+    while IFS= read -r sess; do
+      [[ -z "$sess" ]] && continue
+      while IFS=$'\t' read -r win winname pane layout cwd tty; do
+        local fg; fg=$(_pane_fg_cmd "$tty")
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+          "$(_tsv "$sess")" "$win" "$(_tsv "$winname")" "$pane" \
+          "$(_tsv "$layout")" "$(_tsv "$cwd")" "$(_tsv "$fg")"
+      done < <(tmux list-panes -s -t "$sess" \
+                 -F $'#{window_index}\t#{window_name}\t#{pane_index}\t#{window_layout}\t#{pane_current_path}\t#{pane_tty}' 2>/dev/null)
+    done < <(list_sessions "$filter")
+  } > "$file"
+
+  # keep a stable "latest" pointer and prune old snapshots
+  ln -sf "$(basename "$file")" "$SNAP_DIR/latest.tsv"
+  ls -1t "$SNAP_DIR"/*.tsv 2>/dev/null | grep -v '/latest.tsv$' | tail -n +$((SNAP_KEEP+1)) | xargs -r rm -f
+
+  local n; n=$(grep -vc '^#' "$file")
+  printf '%s✓ saved%s %s panes -> %s\n' "$c_grn" "$c_reset" "$n" "$file"
+}
+
+cmd_snapshots() {
+  local f n created
+  if ! ls "$SNAP_DIR"/*.tsv &>/dev/null; then
+    printf '%sno snapshots yet (run: tmt save)%s\n' "$c_dim" "$c_reset"; return
+  fi
+  printf '%s%-40s %-8s %s%s\n' "$c_bold" "SNAPSHOT" "PANES" "CREATED" "$c_reset"
+  for f in $(ls -1t "$SNAP_DIR"/*.tsv 2>/dev/null); do
+    [[ "$(basename "$f")" == latest.tsv ]] && continue
+    n=$(grep -vc '^#' "$f")
+    created=$(sed -n 's/^# created \([^ ]*\).*/\1/p' "$f" | head -1)
+    printf '%-40s %-8s %s\n' "$(basename "$f")" "$n" "$created"
+  done
+  [[ -L "$SNAP_DIR/latest.tsv" ]] && printf '%slatest -> %s%s\n' "$c_dim" "$(readlink "$SNAP_DIR/latest.tsv")" "$c_reset"
+}
+
+# Resolve a snapshot argument to a path: empty=latest, a name, or a full path.
+_snap_path() {
+  local arg="${1:-}"
+  if [[ -z "$arg" ]]; then printf '%s' "$SNAP_DIR/latest.tsv"; return; fi
+  [[ -f "$arg" ]] && { printf '%s' "$arg"; return; }
+  [[ -f "$SNAP_DIR/$arg" ]] && { printf '%s' "$SNAP_DIR/$arg"; return; }
+  [[ -f "$SNAP_DIR/$arg.tsv" ]] && { printf '%s' "$SNAP_DIR/$arg.tsv"; return; }
+  return 1
+}
+
+cmd_restore() {
+  need tmux
+  local dry=0 run=0 snap=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --dry-run|-n) dry=1; shift ;;
+      --run)        run=1; shift ;;   # also re-run captured commands
+      *)            snap="$1"; shift ;;
+    esac
+  done
+  local file
+  file=$(_snap_path "$snap") || die "snapshot not found: ${snap:-latest} (see: tmt snapshots)"
+
+  # Restore is session-level: one tmux session per task (matches how tmt is
+  # used). We act on the first pane line seen per session; additional
+  # panes/windows in the snapshot are informational only. Full multi-pane
+  # layout revival is intentionally out of scope.
+  local created=0 skipped=0
+  local seen=" "
+  while IFS=$'\t' read -r sess win winname pane layout cwd fg; do
+    [[ "$sess" == \#* || -z "$sess" ]] && continue
+    case "$seen" in *" $sess "*) continue ;; esac   # first line per session only
+    seen+="$sess "
+
+    if [[ $dry -eq 1 ]]; then
+      printf '%swould restore%s %s  cwd=%s%s%s\n' \
+        "$c_cyn" "$c_reset" "$sess" "$cwd" "${fg:+  cmd=}" "$fg"
+      continue
+    fi
+
+    if tmux has-session -t "$sess" 2>/dev/null; then
+      skipped=$((skipped+1)); continue
+    fi
+    tmux new-session -d -s "$sess" -c "$cwd" 2>/dev/null && created=$((created+1))
+    [[ -n "$fg" && $run -eq 1 ]] && tmux send-keys -t "$sess" -- "$fg" Enter
+  done < "$file"
+
+  if [[ $dry -eq 1 ]]; then
+    printf '%s(dry run — nothing changed)%s\n' "$c_dim" "$c_reset"
+  else
+    printf '%s✓ restored%s %s session(s), skipped %s existing  (from %s)\n' \
+      "$c_grn" "$c_reset" "$created" "$skipped" "$(basename "$file")"
+    [[ $run -eq 0 ]] && printf '%stip: re-run captured commands with --run%s\n' "$c_dim" "$c_reset"
+  fi
+}
+
 cmd_watch() {
   have_tmux
   local filter='*' interval=3
@@ -305,7 +453,7 @@ _interactive_capture() {
   printf '\n%s[enter to return]%s' "$c_dim" "$c_reset"; read -r _
 }
 
-usage() { sed -n '3,44p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '3,58p' "$0" | sed 's/^# \{0,1\}//'; }
 
 main() {
   local sub="${1:-watch}"; shift || true
@@ -317,6 +465,9 @@ main() {
     send)        cmd_send "$@" ;;
     key)         cmd_key "$@" ;;
     new)         cmd_new "$@" ;;
+    save)        cmd_save "$@" ;;
+    restore)     cmd_restore "$@" ;;
+    snapshots)   cmd_snapshots "$@" ;;
     agent-scan)  cmd_agent_scan "$@" ;;
     attach)      cmd_attach "$@" ;;
     version|--version|-V) printf 'tmt (tmux-tasks) %s\n' "$TMT_VERSION" ;;

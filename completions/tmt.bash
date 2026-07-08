@@ -3,7 +3,7 @@ _tmt() {
   local cur prev subcmds
   cur="${COMP_WORDS[COMP_CWORD]}"
   prev="${COMP_WORDS[COMP_CWORD-1]}"
-  subcmds="watch ls status capture send key new agent-scan attach version help"
+  subcmds="watch ls status capture send key new save restore snapshots agent-scan attach version help"
 
   # complete the subcommand itself
   if [[ $COMP_CWORD -eq 1 ]]; then
@@ -23,6 +23,20 @@ _tmt() {
       ;;
     watch|ls|agent-scan)
       [[ "$cur" == -* ]] && mapfile -t COMPREPLY < <(compgen -W "--filter --interval --json" -- "$cur")
+      return
+      ;;
+    save)
+      [[ "$cur" == -* ]] && mapfile -t COMPREPLY < <(compgen -W "--filter --name" -- "$cur")
+      return
+      ;;
+    restore)
+      if [[ "$cur" == -* ]]; then
+        mapfile -t COMPREPLY < <(compgen -W "--run --dry-run" -- "$cur")
+      else
+        local sdir="${XDG_DATA_HOME:-$HOME/.local/share}/tmux-tasks/snapshots"
+        local snaps; snaps=$(cd "$sdir" 2>/dev/null && ls -1 *.tsv 2>/dev/null | grep -v '^latest.tsv$')
+        mapfile -t COMPREPLY < <(compgen -W "$snaps" -- "$cur")
+      fi
       return
       ;;
   esac
