@@ -1,0 +1,328 @@
+#!/usr/bin/env bash
+#
+# tmt (tmux-tasks) — monitor & interact with per-task tmux sessions from one place.
+#
+# You run each task in its own tmux session. This tool lists them, detects
+# whether each is running / idle / waiting-for-input, shows a live table, and
+# lets you send input to a session without attaching. It also has an
+# `agent-scan` subcommand that emits a compact digest a coding agent can read
+# to interpret status and decide what input to send.
+#
+# Subcommands:
+#   watch [--filter GLOB] [--interval N]   Live table + single-key actions (default)
+#   ls    [--filter GLOB]                   One-shot table, then exit
+#   status SESSION                          Detailed view of one session
+#   capture SESSION [--lines N]             Dump a session's pane (for humans/agents)
+#   send  SESSION -- TEXT...                Send a line of input to a session
+#   key   SESSION KEY...                    Send raw tmux keys (e.g. Enter, C-c, y)
+#   new   NAME [-- CMD...]                   Create a task session (optionally run CMD)
+#   agent-scan [--filter GLOB] [--json]     Digest of all sessions for an agent
+#   attach SESSION                          Attach to a session (exits monitor)
+#   version                                 Print version
+#
+# State detection (mixed CLI tools):
+#   RUNNING  a non-shell process is foreground and output is moving
+#   WAITING  last line looks like an interactive prompt (y/n, password, ?, :)
+#   IDLE     foreground process is a shell (nothing running)
+#   STALE    non-shell process but output unchanged since last scan (maybe hung)
+
+set -uo pipefail
+
+TMT_VERSION="0.1.0"
+
+STATE_DIR="${TMPDIR:-/tmp}/tmux-tasks-${USER:-$(id -un)}"
+mkdir -p "$STATE_DIR"
+
+SHELLS='^(bash|zsh|sh|fish|dash|tcsh|ksh|-bash|-zsh)$'
+
+# Prompt patterns that indicate a program is blocked waiting for the user.
+PROMPT_RE='(\?[[:space:]]*$|\((y|Y)(es)?/(n|N)(o)?\)|\[[yYnN]/[yYnN]\]|[Pp]assword.*:|[Pp]assphrase.*:|[Cc]ontinue\??|[Pp]roceed|[Oo]verwrite|\[y/N\]|\[Y/n\]|press[[:space:]]+enter|:[[:space:]]*$|❯[[:space:]]*$|»[[:space:]]*$)'
+
+c_reset=$'\033[0m'; c_dim=$'\033[2m'; c_bold=$'\033[1m'
+c_red=$'\033[31m'; c_grn=$'\033[32m'; c_yel=$'\033[33m'; c_blu=$'\033[34m'; c_cyn=$'\033[36m'
+
+die() { printf '%s\n' "$*" >&2; exit 1; }
+need() { command -v "$1" &>/dev/null || die "required command not found: $1"; }
+have_tmux() { need tmux; tmux info &>/dev/null || die "no tmux server running (start a session first)"; }
+
+# List session names, optionally filtered by a glob against the name.
+list_sessions() {
+  local filter="${1:-*}"
+  tmux list-sessions -F '#{session_name}' 2>/dev/null | while IFS= read -r s; do
+    # shellcheck disable=SC2053
+    [[ "$s" == $filter ]] && printf '%s\n' "$s"
+  done
+}
+
+# Sanitize a session name into a filename-safe key.
+key_of() { printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_'; }
+
+# Detect state for a session. Echoes: "STATE<TAB>CMD<TAB>LASTLINE"
+detect() {
+  local sess="$1"
+  local cmd pane last hash prev statef
+  cmd=$(tmux display-message -t "$sess" -p '#{pane_current_command}' 2>/dev/null)
+  pane=$(tmux capture-pane -t "$sess" -p 2>/dev/null)
+  last=$(printf '%s\n' "$pane" | grep -v '^[[:space:]]*$' | tail -n 1)
+  hash=$(printf '%s' "$pane" | cksum | cut -d' ' -f1)
+
+  statef="$STATE_DIR/$(key_of "$sess").hash"
+  prev=""; [[ -f "$statef" ]] && prev=$(<"$statef")
+  printf '%s' "$hash" > "$statef"
+
+  local state
+  if [[ "$last" =~ $PROMPT_RE ]]; then
+    state="WAITING"
+  elif [[ "$cmd" =~ $SHELLS ]]; then
+    state="IDLE"
+  elif [[ -n "$prev" && "$prev" == "$hash" ]]; then
+    state="STALE"
+  else
+    state="RUNNING"
+  fi
+  printf '%s\t%s\t%s\n' "$state" "$cmd" "$last"
+}
+
+state_color() {
+  case "$1" in
+    RUNNING) printf '%s' "$c_grn" ;;
+    WAITING) printf '%s' "$c_yel" ;;
+    STALE)   printf '%s' "$c_red" ;;
+    IDLE)    printf '%s' "$c_dim" ;;
+    *)       printf '%s' "$c_reset" ;;
+  esac
+}
+
+state_icon() {
+  case "$1" in
+    RUNNING) printf '▶' ;;
+    WAITING) printf '⏳' ;;
+    STALE)   printf '■' ;;
+    IDLE)    printf '·' ;;
+    *)       printf '?' ;;
+  esac
+}
+
+# Print the table. Populates global arrays SESS[] and STATE[] for interactive use.
+declare -a SESS STATE
+render_table() {
+  local filter="${1:-*}"
+  SESS=(); STATE=()
+  local i=0 sess line st rest cmd last
+  printf '%s%-3s %-2s %-9s %-26s %s%s\n' "$c_bold" "#" "" "STATE" "SESSION" "LAST LINE" "$c_reset"
+  while IFS= read -r sess; do
+    [[ -z "$sess" ]] && continue
+    line=$(detect "$sess")
+    st=${line%%$'\t'*}; rest=${line#*$'\t'}; cmd=${rest%%$'\t'*}; last=${rest#*$'\t'}
+    SESS[i]="$sess"; STATE[i]="$st"
+    last=${last:0:60}
+    printf '%s%-3s %s%-2s %-9s%s %-26s %s%s%s\n' \
+      "$c_dim" "$i" "$(state_color "$st")" "$(state_icon "$st")" "$st" "$c_reset" \
+      "${sess:0:26}" "$c_dim" "$last" "$c_reset"
+    i=$((i+1))
+  done < <(list_sessions "$filter")
+  [[ $i -eq 0 ]] && printf '%s(no sessions match)%s\n' "$c_dim" "$c_reset"
+  return 0
+}
+
+cmd_ls() {
+  have_tmux
+  local filter='*'
+  [[ "${1:-}" == "--filter" ]] && { filter="$2"; }
+  render_table "$filter"
+}
+
+cmd_status() {
+  have_tmux
+  local sess="${1:?usage: tmt status SESSION}"
+  local line st rest cmd last
+  line=$(detect "$sess")
+  st=${line%%$'\t'*}; rest=${line#*$'\t'}; cmd=${rest%%$'\t'*}; last=${rest#*$'\t'}
+  printf '%sSession:%s %s\n' "$c_bold" "$c_reset" "$sess"
+  printf '%sState:  %s %s%s%s  (fg process: %s)\n' "$c_bold" "$c_reset" "$(state_color "$st")" "$st" "$c_reset" "$cmd"
+  printf '%s--- last 25 lines %s\n' "$c_dim" "$c_reset"
+  tmux capture-pane -t "$sess" -p -S -25 2>/dev/null
+}
+
+cmd_capture() {
+  have_tmux
+  local sess="${1:?usage: tmt capture SESSION [--lines N]}"; shift
+  local lines=100
+  [[ "${1:-}" == "--lines" ]] && lines="$2"
+  tmux capture-pane -t "$sess" -p -S "-$lines" 2>/dev/null
+}
+
+cmd_send() {
+  have_tmux
+  local sess="${1:?usage: tmt send SESSION -- TEXT}"; shift
+  [[ "${1:-}" == "--" ]] && shift
+  local text="$*"
+  tmux send-keys -t "$sess" -- "$text" Enter && \
+    printf '%s→ sent to %s:%s %s\n' "$c_grn" "$sess" "$c_reset" "$text"
+}
+
+cmd_key() {
+  have_tmux
+  local sess="${1:?usage: tmt key SESSION KEY...}"; shift
+  tmux send-keys -t "$sess" "$@" && \
+    printf '%s→ sent keys to %s:%s %s\n' "$c_grn" "$sess" "$c_reset" "$*"
+}
+
+cmd_new() {
+  need tmux
+  local name="${1:?usage: tmt new NAME [-- CMD...]}"; shift
+  if tmux has-session -t "$name" 2>/dev/null; then
+    die "session already exists: $name"
+  fi
+  tmux new-session -d -s "$name" || die "failed to create session: $name"
+  if [[ "${1:-}" == "--" ]]; then
+    shift
+    tmux send-keys -t "$name" -- "$*" Enter
+  fi
+  printf '%s✓ created session%s %s\n' "$c_grn" "$c_reset" "$name"
+}
+
+cmd_attach() {
+  have_tmux
+  local sess="${1:?usage: tmt attach SESSION}"
+  exec tmux attach -t "$sess"
+}
+
+# Emit a digest a coding agent can read to summarize/decide input.
+cmd_agent_scan() {
+  have_tmux
+  local filter='*' json=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --filter) filter="$2"; shift 2 ;;
+      --json)   json=1; shift ;;
+      *) shift ;;
+    esac
+  done
+
+  if [[ $json -eq 1 ]]; then
+    need jq
+    local first=1
+    printf '['
+    while IFS= read -r sess; do
+      [[ -z "$sess" ]] && continue
+      local line st rest cmd tail
+      line=$(detect "$sess")
+      st=${line%%$'\t'*}; rest=${line#*$'\t'}; cmd=${rest%%$'\t'*}
+      tail=$(tmux capture-pane -t "$sess" -p -S -20 2>/dev/null)
+      [[ $first -eq 0 ]] && printf ','
+      first=0
+      jq -n --arg s "$sess" --arg st "$st" --arg c "$cmd" --arg t "$tail" \
+        '{session:$s, state:$st, fg_process:$c, pane_tail:$t}'
+    done < <(list_sessions "$filter")
+    printf ']\n'
+  else
+    while IFS= read -r sess; do
+      [[ -z "$sess" ]] && continue
+      local line st rest cmd
+      line=$(detect "$sess")
+      st=${line%%$'\t'*}; rest=${line#*$'\t'}; cmd=${rest%%$'\t'*}
+      printf '### session: %s\nstate: %s\nfg_process: %s\n--- pane tail ---\n' "$sess" "$st" "$cmd"
+      tmux capture-pane -t "$sess" -p -S -20 2>/dev/null
+      printf '\n\n'
+    done < <(list_sessions "$filter")
+  fi
+}
+
+cmd_watch() {
+  have_tmux
+  local filter='*' interval=3
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --filter)   filter="$2"; shift 2 ;;
+      --interval) interval="$2"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+
+  while true; do
+    printf '\033[H\033[2J'  # home + clear
+    printf '%stmt%s  filter=%s  %s(refresh %ss)%s\n\n' "$c_bold$c_cyn" "$c_reset" "$filter" "$c_dim" "$interval" "$c_reset"
+    render_table "$filter"
+    printf '\n%s[#]attach  [s]end-input  [c]apture  [k]ey  [r]efresh  [q]uit%s\n> ' "$c_dim" "$c_reset"
+
+    local input=''
+    read -r -t "$interval" input || { continue; }   # timeout → auto-refresh
+    [[ -z "$input" ]] && continue
+
+    case "$input" in
+      q|quit) printf 'bye\n'; break ;;
+      r)      continue ;;
+      s)      _interactive_send ;;
+      c)      _interactive_capture ;;
+      k)      _interactive_key ;;
+      [0-9]*) _interactive_attach "$input" ;;
+      *) ;;
+    esac
+  done
+}
+
+_pick() {  # echo session name for an index, or empty
+  local idx="$1"
+  [[ "$idx" =~ ^[0-9]+$ ]] || return 1
+  [[ -n "${SESS[idx]:-}" ]] && printf '%s' "${SESS[idx]}"
+}
+
+_interactive_attach() {
+  local sess; sess=$(_pick "$1") || { printf 'no such #\n'; sleep 1; return; }
+  [[ -z "$sess" ]] && { printf 'no such #\n'; sleep 1; return; }
+  printf 'attaching to %s (detach with ctrl-b d)...\n' "$sess"; sleep 0.5
+  tmux attach -t "$sess"
+}
+
+_interactive_send() {
+  printf 'session #: '; local n; read -r n
+  local sess; sess=$(_pick "$n") || { printf 'bad #\n'; sleep 1; return; }
+  [[ -z "$sess" ]] && { printf 'bad #\n'; sleep 1; return; }
+  printf '%slast line of %s:%s\n' "$c_dim" "$sess" "$c_reset"
+  tmux capture-pane -t "$sess" -p 2>/dev/null | grep -v '^[[:space:]]*$' | tail -n 1
+  printf 'text to send (Enter appended): '; local text; read -r text
+  printf 'send %s"%s"%s to %s? [y/N] ' "$c_yel" "$text" "$c_reset" "$sess"
+  local ok; read -r ok
+  [[ "$ok" == y || "$ok" == Y ]] && tmux send-keys -t "$sess" -- "$text" Enter && { printf 'sent.\n'; sleep 0.6; }
+}
+
+_interactive_key() {
+  printf 'session #: '; local n; read -r n
+  local sess; sess=$(_pick "$n") || { printf 'bad #\n'; sleep 1; return; }
+  [[ -z "$sess" ]] && { printf 'bad #\n'; sleep 1; return; }
+  printf 'tmux key(s) to send (e.g. Enter, C-c, y Enter): '; local keys; read -r keys
+  # shellcheck disable=SC2086
+  tmux send-keys -t "$sess" $keys && { printf 'sent.\n'; sleep 0.6; }
+}
+
+_interactive_capture() {
+  printf 'session #: '; local n; read -r n
+  local sess; sess=$(_pick "$n") || { printf 'bad #\n'; sleep 1; return; }
+  [[ -z "$sess" ]] && { printf 'bad #\n'; sleep 1; return; }
+  printf '\033[2J\033[H'
+  cmd_status "$sess"
+  printf '\n%s[enter to return]%s' "$c_dim" "$c_reset"; read -r _
+}
+
+usage() { sed -n '3,44p' "$0" | sed 's/^# \{0,1\}//'; }
+
+main() {
+  local sub="${1:-watch}"; shift || true
+  case "$sub" in
+    watch)       cmd_watch "$@" ;;
+    ls|list)     cmd_ls "$@" ;;
+    status)      cmd_status "$@" ;;
+    capture)     cmd_capture "$@" ;;
+    send)        cmd_send "$@" ;;
+    key)         cmd_key "$@" ;;
+    new)         cmd_new "$@" ;;
+    agent-scan)  cmd_agent_scan "$@" ;;
+    attach)      cmd_attach "$@" ;;
+    version|--version|-V) printf 'tmt (tmux-tasks) %s\n' "$TMT_VERSION" ;;
+    -h|--help|help) usage ;;
+    *) die "unknown subcommand: $sub (try: tmt --help)" ;;
+  esac
+}
+
+main "$@"
