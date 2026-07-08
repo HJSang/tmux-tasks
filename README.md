@@ -92,7 +92,28 @@ tmt watch --filter 'task/2026-07-08/*'
 
 ## Agent integration
 
-`tmt agent-scan --json` emits `{session, state, fg_process, pane_tail}` per session. Point a Claude Code session at it to summarize status and, for any WAITING session, propose input for you to approve. Allowlist the read-only calls in `~/.claude/settings.json` (`tmt ls/status/capture/agent-scan`) and leave `tmt send`/`key` off the allowlist so the agent always confirms before typing.
+`tmt agent-scan --json` emits `{session, state, fg_process, type, task, isolation, pane_tail}` per session. Point a Claude Code session at it to summarize status and, for any WAITING session, propose input for you to approve. Allowlist the read-only calls in `~/.claude/settings.json` (`tmt ls/status/capture/agent-scan/registry`) and leave `tmt send`/`key` off the allowlist so the agent always confirms before typing.
+
+### Orchestration (multi-agent, in progress)
+
+`tmt` is growing into a supervisor for many long-lived, isolated agent tasks driven by a Claude Code orchestrator. See [`DESIGN.md`](DESIGN.md) for the full two-tier model (native subagents *within* a task; `tmt` *across* tasks). Shipped so far (Phase A):
+
+- **Agent-consumable I/O** — colors auto-strip when stdout isn't a TTY (or set `NO_COLOR=1`); stable exit codes (`0` ok · `2` usage · `3` no session · `4` locked · `5` policy-denied · `6` no tmux · `7` timeout).
+- **Session registry** — per-task metadata (type, task, isolation, ready-pattern) at `~/.local/share/tmux-tasks/registry/`. `tmt registry [SESSION]` prints it as JSON.
+- **`tmt dispatch`** — create one isolated giant task and register it:
+
+```bash
+# independent project (cwd isolation)
+tmt dispatch task/perf-audit --type aider --isolation cwd --cwd ~/projects/perf -- 'aider .'
+
+# same-repo task (git worktree isolation — own branch + working tree)
+tmt dispatch task/auth-rewrite --type claude --isolation worktree \
+    --repo ~/code/app --branch auth-rewrite -- 'claude'
+```
+
+Worktree tasks get a dedicated `git worktree` under `<repo>/../tmt-worktrees/<branch>`, so multiple long-lived agents on one repo can't corrupt each other's tree.
+
+Not yet shipped: `tmt ask` (send-and-await-reply), the auto-response policy layer, and the `tmt-orchestrate` skill. See `DESIGN.md` phases B–D.
 
 ## License
 

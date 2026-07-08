@@ -61,4 +61,40 @@ rcwd=$(tmux display-message -t "$P/running" -p '#{pane_current_path}' 2>/dev/nul
 [[ "$rcwd" == /tmp ]] && ok "restore recreated session in correct cwd" || bad "restore cwd: got '$rcwd'"
 rm -f "$snapdir/$P"-*.tsv
 
+# --- Phase A: agent-consumable I/O, registry, dispatch --------------------
+
+# colors stripped when stdout is not a TTY
+if "$TMT" version | cat -v | grep -q '\^\['; then bad "ansi leaks when piped"; else ok "no ansi when piped"; fi
+
+# stable exit codes
+"$TMT" status "nope-$$" >/dev/null 2>&1; [[ $? -eq 3 ]] && ok "exit 3 on no-session" || bad "no-session exit code"
+"$TMT" bogus-sub       >/dev/null 2>&1; [[ $? -eq 2 ]] && ok "exit 2 on bad usage"  || bad "usage exit code"
+
+# dispatch (cwd isolation) writes registry + launches
+regdir="${XDG_DATA_HOME:-$HOME/.local/share}/tmux-tasks/registry"
+"$TMT" dispatch "$P/disp" --type shell --isolation cwd --cwd /tmp -- 'sleep 60' >/dev/null
+sleep 0.5
+tmux has-session -t "$P/disp" 2>/dev/null && ok "dispatch created session" || bad "dispatch: no session"
+rtype=$("$TMT" registry "$P/disp" | jq -r .type)
+[[ "$rtype" == shell ]] && ok "registry records type" || bad "registry type: got '$rtype'"
+ready=$("$TMT" registry "$P/disp" | jq -r .ready_pattern)
+[[ "$ready" == "<<<TMT_READY:$P/disp>>>" ]] && ok "registry has sentinel ready-pattern" || bad "ready_pattern: '$ready'"
+
+# agent-scan carries registry fields
+scantype=$("$TMT" agent-scan --filter "$P/disp" --json | jq -r '.[0].type')
+[[ "$scantype" == shell ]] && ok "agent-scan includes type" || bad "agent-scan type: '$scantype'"
+
+# dispatch worktree isolation makes a real git worktree
+gt=$(mktemp -d); git -C "$gt" init -q
+git -C "$gt" -c user.email=a@b.c -c user.name=t commit -q --allow-empty -m init
+"$TMT" dispatch "$P/wt" --type claude --isolation worktree --repo "$gt" --branch b1 -- 'sleep 60' >/dev/null
+sleep 0.5
+wcwd=$(tmux display-message -t "$P/wt" -p '#{pane_current_path}' 2>/dev/null)
+[[ "$wcwd" == *tmt-worktrees/b1 ]] && ok "worktree session cwd is the worktree" || bad "worktree cwd: '$wcwd'"
+
+# cleanup phase A
+tmux kill-session -t "$P/disp" 2>/dev/null; tmux kill-session -t "$P/wt" 2>/dev/null
+rm -f "$regdir/${P//\//_}"*.json
+rm -rf "$gt" "$(dirname "$gt")/tmt-worktrees" 2>/dev/null
+
 exit $fail

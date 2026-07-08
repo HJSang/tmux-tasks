@@ -16,6 +16,9 @@
 #   send  SESSION -- TEXT...                Send a line of input to a session
 #   key   SESSION KEY...                    Send raw tmux keys (e.g. Enter, C-c, y)
 #   new   NAME [-- CMD...]                   Create a task session (optionally run CMD)
+#   dispatch NAME --type T [--isolation worktree|cwd] [--repo D] [--branch B]
+#            [--cwd D] -- "CMD"              Create one isolated giant task + register it
+#   registry [SESSION]                       Show session metadata (JSON)
 #   save  [--filter GLOB] [--name NAME]     Snapshot session layout+cwd+cmd to disk
 #   restore [SNAPSHOT] [--run] [--dry-run]  Recreate sessions from a snapshot
 #   snapshots                               List saved snapshots
@@ -37,29 +40,49 @@
 
 set -uo pipefail
 
-TMT_VERSION="0.2.0"
+TMT_VERSION="0.3.0"
+
+# Stable exit codes (see DESIGN.md §5) so a program consumer can branch on them.
+EX_OK=0; EX_USAGE=2; EX_NOSESSION=3; EX_LOCKED=4; EX_POLICY=5; EX_NOTMUX=6; EX_TIMEOUT=7
+
+# Data root. Everything persistent lives here (NOT /tmp, which reboots wipe).
+DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/tmux-tasks"
 
 # Ephemeral scan state (pane hashes for RUNNING vs STALE). OK to lose on reboot.
 STATE_DIR="${TMPDIR:-/tmp}/tmux-tasks-${USER:-$(id -un)}"
 mkdir -p "$STATE_DIR"
 
-# Persistent snapshots for save/restore. MUST NOT be under /tmp — that is
-# often wiped on reboot, which is the exact event we protect against.
-SNAP_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/tmux-tasks/snapshots"
+# Persistent snapshots for save/restore.
+SNAP_DIR="$DATA_DIR/snapshots"
 mkdir -p "$SNAP_DIR"
 SNAP_KEEP=20   # how many timestamped snapshots to retain
+
+# Persistent per-session metadata (type, task, isolation, ready-pattern, ...).
+REG_DIR="$DATA_DIR/registry"
+mkdir -p "$REG_DIR"
 
 SHELLS='^(bash|zsh|sh|fish|dash|tcsh|ksh|-bash|-zsh)$'
 
 # Prompt patterns that indicate a program is blocked waiting for the user.
 PROMPT_RE='(\?[[:space:]]*$|\((y|Y)(es)?/(n|N)(o)?\)|\[[yYnN]/[yYnN]\]|[Pp]assword.*:|[Pp]assphrase.*:|[Cc]ontinue\??|[Pp]roceed|[Oo]verwrite|\[y/N\]|\[Y/n\]|press[[:space:]]+enter|:[[:space:]]*$|❯[[:space:]]*$|»[[:space:]]*$)'
 
-c_reset=$'\033[0m'; c_dim=$'\033[2m'; c_bold=$'\033[1m'
-c_red=$'\033[31m'; c_grn=$'\033[32m'; c_yel=$'\033[33m'; c_blu=$'\033[34m'; c_cyn=$'\033[36m'
+# Colors only when stdout is a real terminal, so a program consuming our output
+# (the orchestrator) never has to strip ANSI. NO_COLOR=1 also disables them.
+if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
+  c_reset=$'\033[0m'; c_dim=$'\033[2m'; c_bold=$'\033[1m'
+  c_red=$'\033[31m'; c_grn=$'\033[32m'; c_yel=$'\033[33m'; c_blu=$'\033[34m'; c_cyn=$'\033[36m'
+else
+  c_reset=''; c_dim=''; c_bold=''; c_red=''; c_grn=''; c_yel=''; c_blu=''; c_cyn=''
+fi
 
-die() { printf '%s\n' "$*" >&2; exit 1; }
+# die [CODE] MESSAGE...  — default code EX_USAGE.
+die() {
+  local code=$EX_USAGE
+  [[ "${1:-}" =~ ^[0-9]+$ ]] && { code="$1"; shift; }
+  printf '%s\n' "$*" >&2; exit "$code"
+}
 need() { command -v "$1" &>/dev/null || die "required command not found: $1"; }
-have_tmux() { need tmux; tmux info &>/dev/null || die "no tmux server running (start a session first)"; }
+have_tmux() { need tmux; tmux info &>/dev/null || die "$EX_NOTMUX" "no tmux server running (start a session first)"; }
 
 # List session names, optionally filtered by a glob against the name.
 list_sessions() {
@@ -151,6 +174,7 @@ cmd_ls() {
 cmd_status() {
   have_tmux
   local sess="${1:?usage: tmt status SESSION}"
+  tmux has-session -t "$sess" 2>/dev/null || die "$EX_NOSESSION" "no such session: $sess"
   local line st rest cmd last
   line=$(detect "$sess")
   st=${line%%$'\t'*}; rest=${line#*$'\t'}; cmd=${rest%%$'\t'*}; last=${rest#*$'\t'}
@@ -163,6 +187,7 @@ cmd_status() {
 cmd_capture() {
   have_tmux
   local sess="${1:?usage: tmt capture SESSION [--lines N]}"; shift
+  tmux has-session -t "$sess" 2>/dev/null || die "$EX_NOSESSION" "no such session: $sess"
   local lines=100
   [[ "${1:-}" == "--lines" ]] && lines="$2"
   tmux capture-pane -t "$sess" -p -S "-$lines" 2>/dev/null
@@ -171,6 +196,7 @@ cmd_capture() {
 cmd_send() {
   have_tmux
   local sess="${1:?usage: tmt send SESSION -- TEXT}"; shift
+  tmux has-session -t "$sess" 2>/dev/null || die "$EX_NOSESSION" "no such session: $sess"
   [[ "${1:-}" == "--" ]] && shift
   local text="$*"
   tmux send-keys -t "$sess" -- "$text" Enter && \
@@ -180,6 +206,7 @@ cmd_send() {
 cmd_key() {
   have_tmux
   local sess="${1:?usage: tmt key SESSION KEY...}"; shift
+  tmux has-session -t "$sess" 2>/dev/null || die "$EX_NOSESSION" "no such session: $sess"
   tmux send-keys -t "$sess" "$@" && \
     printf '%s→ sent keys to %s:%s %s\n' "$c_grn" "$sess" "$c_reset" "$*"
 }
@@ -204,6 +231,112 @@ cmd_attach() {
   exec tmux attach -t "$sess"
 }
 
+# --- session registry -----------------------------------------------------
+#
+# Per-session metadata as JSON at $REG_DIR/<key>.json. Lets the orchestrator
+# know WHAT each session is (type, task, isolation, ready-pattern) rather than
+# only shell-vs-nonshell. Written by dispatch/new; read by agent-scan/registry.
+
+reg_file() { printf '%s/%s.json' "$REG_DIR" "$(key_of "$1")"; }
+
+# reg_write SESSION TYPE TASK ISOLATION LOCATION BRANCH READY
+reg_write() {
+  need jq
+  local sess="$1" type="$2" task="$3" iso="$4" loc="$5" branch="$6" ready="$7"
+  jq -n --arg s "$sess" --arg ty "$type" --arg ta "$task" --arg is "$iso" \
+        --arg lo "$loc" --arg br "$branch" --arg re "$ready" \
+    '{session:$s, type:$ty, task:$ta, isolation:$is, location:$lo, branch:$br, ready_pattern:$re}' \
+    > "$(reg_file "$sess")"
+}
+
+# Echo a registry field, or empty if unregistered.
+reg_get() {
+  local f; f=$(reg_file "$1"); [[ -f "$f" ]] || return 0
+  jq -r ".${2} // \"\"" "$f" 2>/dev/null
+}
+
+cmd_registry() {
+  need jq
+  local sess="${1:-}"
+  if [[ -n "$sess" ]]; then
+    local f; f=$(reg_file "$sess")
+    [[ -f "$f" ]] || die "$EX_NOSESSION" "no registry entry for: $sess"
+    cat "$f"; return
+  fi
+  # all entries as a JSON array
+  local first=1; printf '['
+  local f
+  for f in "$REG_DIR"/*.json; do
+    [[ -e "$f" ]] || continue
+    [[ $first -eq 0 ]] && printf ','
+    first=0; cat "$f"
+  done
+  printf ']\n'
+}
+
+# --- dispatch: create one isolated giant task -----------------------------
+#
+# tmt dispatch NAME --type TYPE [--isolation worktree|cwd] [--repo DIR]
+#              [--branch B] [--cwd DIR] -- "opening prompt / command"
+#
+# isolation=worktree : git worktree add <repo>/../<branch> -b <branch>; cwd=there
+# isolation=cwd      : run in --cwd (independent project); no worktree created
+cmd_dispatch() {
+  need tmux
+  local name="${1:?usage: tmt dispatch NAME --type TYPE [opts] -- CMD}"; shift
+  local type="shell" iso="cwd" repo="" branch="" cwd="" opening=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --type)      type="$2"; shift 2 ;;
+      --isolation) iso="$2"; shift 2 ;;
+      --repo)      repo="$2"; shift 2 ;;
+      --branch)    branch="$2"; shift 2 ;;
+      --cwd)       cwd="$2"; shift 2 ;;
+      --)          shift; opening="$*"; break ;;
+      *) die "dispatch: unknown option: $1" ;;
+    esac
+  done
+
+  tmux has-session -t "$name" 2>/dev/null && die "session already exists: $name"
+
+  local location=""
+  case "$iso" in
+    worktree)
+      need git
+      [[ -n "$repo" ]] || die "dispatch --isolation worktree requires --repo DIR"
+      [[ -d "$repo/.git" || -f "$repo/.git" ]] || die "not a git repo: $repo"
+      [[ -n "$branch" ]] || branch=$(key_of "$name")
+      # place the worktree in a sibling dir of the repo: <repo>/../tmt-worktrees/<branch>
+      local repo_abs; repo_abs=$(cd "$repo" && pwd)
+      location="$(cd "$repo_abs/.." && pwd)/tmt-worktrees/$branch"
+      if [[ ! -d "$location" ]]; then
+        mkdir -p "$(dirname "$location")"
+        git -C "$repo_abs" worktree add -b "$branch" "$location" 2>/dev/null \
+          || git -C "$repo_abs" worktree add "$location" "$branch" 2>/dev/null \
+          || die "git worktree add failed for branch $branch"
+      fi
+      ;;
+    cwd)
+      location="${cwd:-$PWD}"
+      [[ -d "$location" ]] || die "dispatch --cwd not a directory: $location"
+      ;;
+    *) die "dispatch --isolation must be 'worktree' or 'cwd' (got: $iso)" ;;
+  esac
+
+  tmux new-session -d -s "$name" -c "$location" || die "failed to create session: $name"
+
+  # Readiness marker for this session (sentinel echo, per DESIGN §11.2).
+  local ready="<<<TMT_READY:$name>>>"
+  reg_write "$name" "$type" "$opening" "$iso" "$location" "$branch" "$ready"
+
+  # Launch the opening command / agent.
+  [[ -n "$opening" ]] && tmux send-keys -t "$name" -- "$opening" Enter
+
+  printf '%s✓ dispatched%s %s  type=%s iso=%s\n  location: %s%s\n' \
+    "$c_grn" "$c_reset" "$name" "$type" "$iso" "$location" \
+    "${branch:+$'\n'  branch: $branch}"
+}
+
 # Emit a digest a coding agent can read to summarize/decide input.
 cmd_agent_scan() {
   have_tmux
@@ -222,14 +355,16 @@ cmd_agent_scan() {
     printf '['
     while IFS= read -r sess; do
       [[ -z "$sess" ]] && continue
-      local line st rest cmd tail
+      local line st rest cmd tail type task iso
       line=$(detect "$sess")
       st=${line%%$'\t'*}; rest=${line#*$'\t'}; cmd=${rest%%$'\t'*}
       tail=$(tmux capture-pane -t "$sess" -p -S -20 2>/dev/null)
+      type=$(reg_get "$sess" type); task=$(reg_get "$sess" task); iso=$(reg_get "$sess" isolation)
       [[ $first -eq 0 ]] && printf ','
       first=0
       jq -n --arg s "$sess" --arg st "$st" --arg c "$cmd" --arg t "$tail" \
-        '{session:$s, state:$st, fg_process:$c, pane_tail:$t}'
+            --arg ty "$type" --arg ta "$task" --arg is "$iso" \
+        '{session:$s, state:$st, fg_process:$c, type:$ty, task:$ta, isolation:$is, pane_tail:$t}'
     done < <(list_sessions "$filter")
     printf ']\n'
   else
@@ -453,7 +588,11 @@ _interactive_capture() {
   printf '\n%s[enter to return]%s' "$c_dim" "$c_reset"; read -r _
 }
 
-usage() { sed -n '3,58p' "$0" | sed 's/^# \{0,1\}//'; }
+# Print the leading comment header (lines 3.. up to the first non-comment line),
+# stripping the leading "# ". Robust to the header changing length.
+usage() {
+  awk 'NR<3{next} /^#/{sub(/^# ?/,""); print; next} {exit}' "$0"
+}
 
 main() {
   local sub="${1:-watch}"; shift || true
@@ -465,6 +604,8 @@ main() {
     send)        cmd_send "$@" ;;
     key)         cmd_key "$@" ;;
     new)         cmd_new "$@" ;;
+    dispatch)    cmd_dispatch "$@" ;;
+    registry)    cmd_registry "$@" ;;
     save)        cmd_save "$@" ;;
     restore)     cmd_restore "$@" ;;
     snapshots)   cmd_snapshots "$@" ;;

@@ -151,6 +151,8 @@ Audit log and policy are already on persistent disk, unaffected by reboot.
 
 - **Phase A** — §5 I/O + §3/§4 registry & `dispatch` (cwd + worktree isolation).
   Low risk. Unblocks the orchestrator as a *reader* and task *launcher*.
+  **✅ Shipped in v0.3.0** — TTY-aware color, stable exit codes, JSON registry,
+  `tmt dispatch`/`tmt registry`, enriched `agent-scan`. Covered by smoke tests.
 - **Phase B** — §6 readiness detection + `tmt ask`. The talk-to-agents core.
 - **Phase C** — §7 lock + policy + audit, then the `reply` auto-answer path.
   Autonomy turns on ONLY after this. 
