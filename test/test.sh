@@ -132,4 +132,26 @@ tmux kill-session -t "$P/disp" 2>/dev/null; tmux kill-session -t "$P/wt" 2>/dev/
 rm -f "$regdir/${P//\//_}"*.json
 rm -rf "$gt" "$(dirname "$gt")/tmt-worktrees" 2>/dev/null
 
+# --- Phase B: ask, readiness, lock -------------------------------------------
+
+# lock acquire/contention/release/re-acquire. Record OUR pid ($$) as holder so
+# the liveness check in the contention case sees a live process (the tmt
+# process that acquires exits immediately, so its own pid would look stale).
+"$TMT" _test_lock_acquire "$P/idle" $$ && ok "lock acquired" || bad "lock acquire failed"
+"$TMT" _test_lock_acquire "$P/idle" 2>/dev/null; [[ $? -eq 4 ]] && ok "lock contention exits 4" || bad "lock contention"
+"$TMT" _test_lock_release "$P/idle" && ok "lock released" || bad "lock release failed"
+"$TMT" _test_lock_acquire "$P/idle" $$ && ok "lock re-acquire after release" || bad "lock re-acquire failed"
+"$TMT" _test_lock_release "$P/idle"
+
+# stale lock steal: a lock recording a dead pid is auto-stolen. Spawn and reap
+# a child so we have a pid that is guaranteed dead (hardcoded pids can collide
+# with live processes on busy hosts).
+( : ) & deadpid=$!; wait "$deadpid" 2>/dev/null
+statedir="${TMPDIR:-/tmp}/tmux-tasks-${USER:-$(id -un)}"
+stalekey=$(printf '%s' "$P/idle" | tr -c 'A-Za-z0-9._-' '_')
+mkdir -p "$statedir/$stalekey.lock"
+echo "$deadpid" > "$statedir/$stalekey.lock/pid"
+"$TMT" _test_lock_acquire "$P/idle" $$ && ok "stale lock stolen" || bad "stale lock not stolen"
+"$TMT" _test_lock_release "$P/idle"
+
 exit $fail

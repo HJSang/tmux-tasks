@@ -68,6 +68,44 @@ SHELLS='^(bash|zsh|sh|fish|dash|tcsh|ksh|-bash|-zsh)$'
 # Prompt patterns that indicate a program is blocked waiting for the user.
 PROMPT_RE='(\?[[:space:]]*$|\((y|Y)(es)?/(n|N)(o)?\)|\[[yYnN]/[yYnN]\]|[Pp]assword.*:|[Pp]assphrase.*:|[Cc]ontinue\??|[Pp]roceed|[Oo]verwrite|\[y/N\]|\[Y/n\]|press[[:space:]]+enter|:[[:space:]]*$|❯[[:space:]]*$|»[[:space:]]*$)'
 
+# Ready-box pattern: the agent's empty input prompt (turn completed).
+# Separate from PROMPT_RE (which detects questions like y/n). Matches:
+#   ❯  (Claude Code), >  (aider), $  (shell)
+READY_RE='(❯[[:space:]]*$|^>[[:space:]]*$|\$[[:space:]]*$)'
+
+# --- per-session lock (mkdir-based, atomic, no flock dependency) --------------
+#
+# Serializes tmt-initiated input into one session so ask/send can't interleave.
+# The lock dir lives in STATE_DIR (tmpfs): a reboot clears locks automatically.
+# A lock whose recorded pid is dead is stale and gets stolen.
+
+_lock_path() { printf '%s/%s.lock' "$STATE_DIR" "$(key_of "$1")"; }
+
+# _lock_acquire SESSION [PID]  — PID defaults to $$; callers pass a longer-lived
+# pid when the logical holder outlives this process.
+_lock_acquire() {
+  local sess="$1" pid="${2:-$$}" lpath
+  lpath=$(_lock_path "$sess")
+  if mkdir "$lpath" 2>/dev/null; then
+    printf '%s' "$pid" > "$lpath/pid"
+    return 0
+  fi
+  local holder
+  holder=$(cat "$lpath/pid" 2>/dev/null || true)
+  if [[ -n "$holder" ]] && kill -0 "$holder" 2>/dev/null; then
+    die "$EX_LOCKED" "session $sess is locked by pid $holder"
+  fi
+  # Holder dead or unreadable — steal the stale lock.
+  rm -rf "$lpath"
+  if mkdir "$lpath" 2>/dev/null; then
+    printf '%s' "$pid" > "$lpath/pid"
+    return 0
+  fi
+  die "$EX_LOCKED" "session $sess is locked (lost steal race)"
+}
+
+_lock_release() { rm -rf "$(_lock_path "$1")"; }
+
 # Colors only when stdout is a real terminal, so a program consuming our output
 # (the orchestrator) never has to strip ANSI. NO_COLOR=1 also disables them.
 if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
@@ -935,6 +973,10 @@ main() {
     attach)      cmd_attach "$@" ;;
     version|--version|-V) printf 'tmt (tmux-tasks) %s\n' "$TMT_VERSION" ;;
     -h|--help|help) usage ;;
+    # Hidden test hooks (not in help/completions): let test.sh exercise the
+    # lock helpers in-process.
+    _test_lock_acquire) _lock_acquire "$@" ;;
+    _test_lock_release) _lock_release "$@" ;;
     *) die "unknown subcommand: $sub (try: tmt --help)" ;;
   esac
 }
