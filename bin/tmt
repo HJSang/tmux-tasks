@@ -87,18 +87,26 @@ _lock_acquire() {
   local sess="$1" pid="${2:-$$}" lpath
   lpath=$(_lock_path "$sess")
   if mkdir "$lpath" 2>/dev/null; then
-    printf '%s' "$pid" > "$lpath/pid"
+    printf '%s' "$pid" > "$lpath/pid" || { rm -rf "$lpath"; die "$EX_LOCKED" "cannot write lock pid"; }
     return 0
   fi
+  # Require a well-formed positive pid before the liveness probe: kill -0 on
+  # 0/-1 "succeeds" and would make a corrupted lock permanent.
+  # kill -0 EPERM edge: STATE_DIR is per-user, so an unsignalable pid means the
+  # pid was recycled by another user's process — the real holder is dead.
   local holder
   holder=$(cat "$lpath/pid" 2>/dev/null || true)
-  if [[ -n "$holder" ]] && kill -0 "$holder" 2>/dev/null; then
+  if [[ "$holder" =~ ^[0-9]+$ ]] && kill -0 "$holder" 2>/dev/null; then
     die "$EX_LOCKED" "session $sess is locked by pid $holder"
   fi
-  # Holder dead or unreadable — steal the stale lock.
-  rm -rf "$lpath"
+  # Holder dead or unreadable — steal via atomic rename so two concurrent
+  # stealers can't both win: only one mv succeeds, and the loser must not
+  # rm the winner's fresh lock.
+  mv "$lpath" "$lpath.stale.$$" 2>/dev/null \
+    || die "$EX_LOCKED" "session $sess is locked (lost steal race)"
+  rm -rf "$lpath.stale.$$"
   if mkdir "$lpath" 2>/dev/null; then
-    printf '%s' "$pid" > "$lpath/pid"
+    printf '%s' "$pid" > "$lpath/pid" || { rm -rf "$lpath"; die "$EX_LOCKED" "cannot write lock pid"; }
     return 0
   fi
   die "$EX_LOCKED" "session $sess is locked (lost steal race)"

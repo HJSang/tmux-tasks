@@ -10,7 +10,11 @@ ok()   { printf '\033[32mok\033[0m   %s\n' "$*"; }
 bad()  { printf '\033[31mFAIL\033[0m %s\n' "$*"; fail=1; }
 
 command -v tmux >/dev/null || { echo "tmux not installed; skipping"; exit 0; }
-cleanup() { for s in idle running waiting; do tmux kill-session -t "$P/$s" 2>/dev/null; done; }
+cleanup() {
+  for s in idle running waiting; do tmux kill-session -t "$P/$s" 2>/dev/null; done
+  # remove any lock dirs (ours, or strays left by an aborted prior run)
+  rm -rf "${TMPDIR:-/tmp}/tmux-tasks-${USER:-$(id -un)}"/tmttest_*.lock 2>/dev/null
+}
 trap cleanup EXIT
 
 # version works with no tmux dependency
