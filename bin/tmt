@@ -14,6 +14,8 @@
 #   status SESSION                          Detailed view of one session
 #   capture SESSION [--lines N]             Dump a session's pane (for humans/agents)
 #   send  SESSION -- TEXT...                Send a line of input to a session
+#   ask   SESSION [--timeout S] [--quiescent S] [--lines N] -- PROMPT
+#                                           Send prompt, await reply (JSON output)
 #   key   SESSION KEY...                    Send raw tmux keys (e.g. Enter, C-c, y)
 #   new   NAME [-- CMD...]                   Create a task session (optionally run CMD)
 #   dispatch NAME --type T [--isolation worktree|cwd] [--repo D] [--branch B]
@@ -42,7 +44,7 @@
 
 set -uo pipefail
 
-TMT_VERSION="0.3.4"
+TMT_VERSION="0.4.0"
 
 # Stable exit codes (see DESIGN.md §5) so a program consumer can branch on them.
 EX_OK=0; EX_USAGE=2; EX_NOSESSION=3; EX_LOCKED=4; EX_POLICY=5; EX_NOTMUX=6; EX_TIMEOUT=7
@@ -67,6 +69,116 @@ SHELLS='^(bash|zsh|sh|fish|dash|tcsh|ksh|-bash|-zsh)$'
 
 # Prompt patterns that indicate a program is blocked waiting for the user.
 PROMPT_RE='(\?[[:space:]]*$|\((y|Y)(es)?/(n|N)(o)?\)|\[[yYnN]/[yYnN]\]|[Pp]assword.*:|[Pp]assphrase.*:|[Cc]ontinue\??|[Pp]roceed|[Oo]verwrite|\[y/N\]|\[Y/n\]|press[[:space:]]+enter|:[[:space:]]*$|❯[[:space:]]*$|»[[:space:]]*$)'
+
+# Ready-box pattern: the agent's empty input prompt (turn completed).
+# Separate from PROMPT_RE (which detects questions like y/n). Matches:
+#   ❯  (Claude Code), >  (aider), $  (shell)
+READY_RE='(❯[[:space:]]*$|^>[[:space:]]*$|\$[[:space:]]*$)'
+
+# --- per-session lock (mkdir-based, atomic, no flock dependency) --------------
+#
+# Serializes tmt-initiated input into one session so ask/send can't interleave.
+# The lock dir lives in STATE_DIR (tmpfs): a reboot clears locks automatically.
+# A lock whose recorded pid is dead is stale and gets stolen.
+
+_lock_path() { printf '%s/%s.lock' "$STATE_DIR" "$(key_of "$1")"; }
+
+# _lock_acquire SESSION [PID]  — PID defaults to $$; callers pass a longer-lived
+# pid when the logical holder outlives this process.
+_lock_acquire() {
+  local sess="$1" pid="${2:-$$}" lpath
+  lpath=$(_lock_path "$sess")
+  if mkdir "$lpath" 2>/dev/null; then
+    printf '%s' "$pid" > "$lpath/pid" || { rm -rf "$lpath"; die "$EX_LOCKED" "cannot write lock pid"; }
+    return 0
+  fi
+  # Require a well-formed positive pid before the liveness probe: kill -0 on
+  # 0/-1 "succeeds" and would make a corrupted lock permanent.
+  # kill -0 EPERM edge: STATE_DIR is per-user, so an unsignalable pid means the
+  # pid was recycled by another user's process — the real holder is dead.
+  local holder
+  holder=$(cat "$lpath/pid" 2>/dev/null || true)
+  if [[ "$holder" =~ ^[0-9]+$ ]] && kill -0 "$holder" 2>/dev/null; then
+    die "$EX_LOCKED" "session $sess is locked by pid $holder"
+  fi
+  # Holder dead or unreadable — steal via atomic rename so two concurrent
+  # stealers can't both win: only one mv succeeds, and the loser must not
+  # rm the winner's fresh lock.
+  mv "$lpath" "$lpath.stale.$$" 2>/dev/null \
+    || die "$EX_LOCKED" "session $sess is locked (lost steal race)"
+  rm -rf "$lpath.stale.$$"
+  if mkdir "$lpath" 2>/dev/null; then
+    printf '%s' "$pid" > "$lpath/pid" || { rm -rf "$lpath"; die "$EX_LOCKED" "cannot write lock pid"; }
+    return 0
+  fi
+  die "$EX_LOCKED" "session $sess is locked (lost steal race)"
+}
+
+_lock_release() { rm -rf "$(_lock_path "$1")"; }
+
+# --- readiness detection (Phase B) -------------------------------------------
+#
+# _turn_done SESSION QUIESCENT_SECS
+#   Checks if the session's pane has been stable for QUIESCENT seconds AND the
+#   tail matches a pattern indicating the agent finished. Prints one of:
+#     "done"    — ready box showing (READY_RE), agent finished its turn
+#     "blocked" — question prompt showing (PROMPT_RE minus the ready-box overlap)
+#     "active"  — pane still changing or hasn't been quiescent long enough
+#
+# Meant to be POLLED (once/sec by ask). The state file records two lines:
+# the pane hash and the epoch second that hash was first observed. The first
+# call after any change (including the very first call ever) resets the timer
+# and reports "active"; subsequent calls accumulate elapsed quiescent time.
+#
+# READY_RE is checked BEFORE PROMPT_RE: a bare `❯ ` matches both (PROMPT_RE
+# includes it as an alternative), but it is a ready box — the agent finished —
+# not a blocking question. PROMPT_RE only classifies "blocked" via its more
+# specific patterns (y/n, password:, continue?, ...).
+#
+# Uses .ask.hash (not .hash) so it never perturbs detect()'s RUNNING/STALE state.
+
+_turn_done() {
+  local sess="$1" quiescent="${2:-5}"
+  local pane last hash statef prev prev_time now elapsed
+
+  pane=$(tmux capture-pane -t "$sess" -p 2>/dev/null)
+  last=$(printf '%s\n' "$pane" | grep -v '^[[:space:]]*$' | tail -n 1)
+  hash=$(printf '%s' "$pane" | cksum | cut -d' ' -f1)
+
+  statef="$STATE_DIR/$(key_of "$sess").ask.hash"
+  now=$(date +%s)
+
+  if [[ -f "$statef" ]]; then
+    prev=$(sed -n '1p' "$statef")
+    prev_time=$(sed -n '2p' "$statef")
+  else
+    prev=""; prev_time="$now"
+  fi
+
+  if [[ "$hash" != "$prev" ]]; then
+    # Pane changed — reset the quiescence timer.
+    printf '%s\n%s\n' "$hash" "$now" > "$statef"
+    printf 'active'
+    return
+  fi
+
+  # Pane unchanged — check how long.
+  elapsed=$((now - prev_time))
+  if [[ "$elapsed" -lt "$quiescent" ]]; then
+    printf 'active'
+    return
+  fi
+
+  # Quiescent long enough. Check what's showing.
+  # READY_RE first: a bare ❯ is a ready box, not a question.
+  if [[ "$last" =~ $READY_RE ]]; then
+    printf 'done'
+  elif [[ "$last" =~ $PROMPT_RE ]]; then
+    printf 'blocked'
+  else
+    printf 'active'
+  fi
+}
 
 # Colors only when stdout is a real terminal, so a program consuming our output
 # (the orchestrator) never has to strip ANSI. NO_COLOR=1 also disables them.
@@ -219,6 +331,10 @@ cmd_send() {
   tmux has-session -t "$sess" 2>/dev/null || die "$EX_NOSESSION" "no such session: $sess"
   [[ "${1:-}" == "--" ]] && shift
   local text="$*"
+  _lock_acquire "$sess"
+  # RETURN traps are global in bash: clear it as it fires so it doesn't fire
+  # again when main() returns (where $sess is out of scope).
+  trap '_lock_release "$sess"; trap - RETURN' RETURN
   _send_line "$sess" "$text" && \
     printf '%s→ sent to %s:%s %s\n' "$c_grn" "$sess" "$c_reset" "$text"
 }
@@ -227,6 +343,8 @@ cmd_key() {
   have_tmux
   local sess="${1:?usage: tmt key SESSION KEY...}"; shift
   tmux has-session -t "$sess" 2>/dev/null || die "$EX_NOSESSION" "no such session: $sess"
+  _lock_acquire "$sess"
+  trap '_lock_release "$sess"; trap - RETURN' RETURN
   tmux send-keys -t "$sess" "$@" && \
     printf '%s→ sent keys to %s:%s %s\n' "$c_grn" "$sess" "$c_reset" "$*"
 }
@@ -398,6 +516,112 @@ cmd_agent_scan() {
       printf '\n\n'
     done < <(list_sessions "$filter")
   fi
+}
+
+# --- ask: send-and-await-reply (Phase B) --------------------------------------
+#
+# tmt ask SESSION [--timeout S] [--quiescent S] [--lines N] -- "prompt"
+#
+# Sends a prompt with an embedded marker, waits for the agent to complete its
+# turn (quiescence + ready-box or question-prompt), then extracts and returns
+# only the new output between the marker and the input box as JSON.
+
+cmd_ask() {
+  have_tmux
+  need jq
+  local sess="${1:?usage: tmt ask SESSION [--timeout S] [--quiescent S] [--lines N] -- PROMPT}"; shift
+  tmux has-session -t "$sess" 2>/dev/null || die "$EX_NOSESSION" "no such session: $sess"
+
+  local timeout=300 quiescent=5 lines=5000
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --timeout)   timeout="$2"; shift 2 ;;
+      --quiescent) quiescent="$2"; shift 2 ;;
+      --lines)     lines="$2"; shift 2 ;;
+      --)          shift; break ;;
+      *)           break ;;
+    esac
+  done
+  local prompt="$*"
+  [[ -z "$prompt" ]] && die "ask: no prompt provided"
+
+  _lock_acquire "$sess"
+  trap '_lock_release "$sess"; trap - RETURN' RETURN
+
+  # Generate a unique marker. The wire text is one line: marker + prompt.
+  local id="$$-$SECONDS"
+  local marker="<<<TMT_ASK:$id>>>"
+  local wire="$marker $prompt"
+
+  # Clear prior ask-hash state so the quiescence timer starts fresh.
+  rm -f "$STATE_DIR/$(key_of "$sess").ask.hash"
+
+  # Send the marker+prompt as one turn.
+  _send_line "$sess" "$wire" || die "ask: send failed"
+
+  # Poll once/second until done, blocked, or timeout.
+  local elapsed=0 state="active"
+  while [[ "$elapsed" -lt "$timeout" ]]; do
+    sleep 1
+    elapsed=$((elapsed + 1))
+    state=$(_turn_done "$sess" "$quiescent")
+    [[ "$state" == "active" ]] && continue
+    break
+  done
+  [[ "$state" == "active" ]] && state="timeout"
+
+  # Capture and extract the reply region.
+  local pane reply=""
+  pane=$(tmux capture-pane -t "$sess" -p -S "-$lines" 2>/dev/null)
+
+  # Anchor on the FIRST occurrence of our marker: that is the echoed input
+  # line. The marker is unique per ask, so stale scrollback can't match; a
+  # LATER occurrence can only be the agent quoting our prompt back (part of
+  # the reply), which must not swallow the reply region.
+  local marker_line_num
+  marker_line_num=$(printf '%s\n' "$pane" | grep -nF "$marker" | head -1 | cut -d: -f1)
+
+  if [[ -n "$marker_line_num" ]]; then
+    # Everything after the marker line, then trim trailing ready-box/blanks.
+    reply=$(printf '%s\n' "$pane" | tail -n "+$((marker_line_num + 1))" | _trim_trailing_ready)
+    # The marker is tmt plumbing: scrub any echo of it from the reply body.
+    reply=${reply//"$marker"/}
+  fi
+
+  # Clean up the ask-hash state file.
+  rm -f "$STATE_DIR/$(key_of "$sess").ask.hash"
+
+  # Output JSON.
+  local exit_code=0
+  [[ "$state" == "timeout" ]] && exit_code=$EX_TIMEOUT
+  jq -n --arg sess "$sess" --arg id "$id" --arg status "$state" \
+        --argjson elapsed "$elapsed" --arg reply "$reply" \
+    '{session:$sess, id:$id, status:$status, elapsed_s:$elapsed, reply:$reply}'
+  return "$exit_code"
+}
+
+# Trim trailing lines that match READY_RE or are blank. Reads stdin, writes stdout.
+_trim_trailing_ready() {
+  local -a buf=()
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    buf+=("$line")
+  done
+  # Walk backward, dropping ready-box and blank lines.
+  local i=${#buf[@]}
+  while [[ $i -gt 0 ]]; do
+    i=$((i - 1))
+    local l="${buf[$i]}"
+    if [[ -z "${l// /}" ]] || [[ "$l" =~ $READY_RE ]]; then
+      unset 'buf[i]'
+    else
+      break
+    fi
+  done
+  # Print remaining lines (preserving order).
+  local line
+  for line in "${buf[@]+"${buf[@]}"}"; do
+    printf '%s\n' "$line"
+  done
 }
 
 # --- serve: live HTML dashboard -------------------------------------------
@@ -923,6 +1147,7 @@ main() {
     status)      cmd_status "$@" ;;
     capture)     cmd_capture "$@" ;;
     send)        cmd_send "$@" ;;
+    ask)         cmd_ask "$@" ;;
     key)         cmd_key "$@" ;;
     new)         cmd_new "$@" ;;
     dispatch)    cmd_dispatch "$@" ;;
@@ -935,6 +1160,11 @@ main() {
     attach)      cmd_attach "$@" ;;
     version|--version|-V) printf 'tmt (tmux-tasks) %s\n' "$TMT_VERSION" ;;
     -h|--help|help) usage ;;
+    # Hidden test hooks (not in help/completions): let test.sh exercise the
+    # lock helpers in-process.
+    _test_lock_acquire) _lock_acquire "$@" ;;
+    _test_lock_release) _lock_release "$@" ;;
+    _test_turn_done)    _turn_done "$@" ;;
     *) die "unknown subcommand: $sub (try: tmt --help)" ;;
   esac
 }
