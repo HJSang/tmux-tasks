@@ -11,7 +11,7 @@ bad()  { printf '\033[31mFAIL\033[0m %s\n' "$*"; fail=1; }
 
 command -v tmux >/dev/null || { echo "tmux not installed; skipping"; exit 0; }
 cleanup() {
-  for s in idle running waiting ready ask askblk asktmo; do tmux kill-session -t "$P/$s" 2>/dev/null; done
+  for s in idle running waiting ready ask askblk asktmo asklk; do tmux kill-session -t "$P/$s" 2>/dev/null; done
   # remove any lock dirs and ask-state files (ours, or strays from prior runs)
   rm -rf "${TMPDIR:-/tmp}/tmux-tasks-${USER:-$(id -un)}"/tmttest_*.lock 2>/dev/null
   rm -f "${TMPDIR:-/tmp}/tmux-tasks-${USER:-$(id -un)}"/tmttest_*.ask.hash 2>/dev/null
@@ -226,5 +226,28 @@ tmostatus=$(printf '%s' "$tmoout" | jq -r .status 2>/dev/null)
 [[ "$tmorc" -eq 7 ]] && ok "ask timeout exits 7" || bad "ask timeout exit: $tmorc"
 [[ "$tmostatus" == "timeout" ]] && ok "ask timeout status field" || bad "ask timeout status: '$tmostatus'"
 tmux kill-session -t "$P/asktmo" 2>/dev/null
+
+# lock contention: ask holds lock, send is rejected, then succeeds after
+tmux kill-session -t "$P/asklk" 2>/dev/null
+tmux new-session -d -s "$P/asklk"
+# Slow agent: reads, waits 4s, prints reply, re-shows ❯
+tmux send-keys -t "$P/asklk" 'printf "❯ "; while true; do read l; sleep 3; echo "done:[$l]"; printf "❯ "; done' Enter
+sleep 1.5
+
+# Launch ask in background (holds lock for ~4-5s)
+"$TMT" ask "$P/asklk" --timeout 15 --quiescent 2 -- 'hold lock' >/dev/null 2>&1 &
+askpid=$!
+sleep 1.5
+
+# While ask is in flight, send should fail with exit 4
+"$TMT" send "$P/asklk" -- 'interloper' 2>/dev/null; lkrc=$?
+[[ "$lkrc" -eq 4 ]] && ok "send blocked during ask" || bad "send during ask: exit $lkrc"
+
+# Wait for ask to finish, then send should succeed
+wait "$askpid" 2>/dev/null
+sleep 0.5
+"$TMT" send "$P/asklk" -- 'after' >/dev/null 2>&1; lkrc2=$?
+[[ "$lkrc2" -eq 0 ]] && ok "send succeeds after ask completes" || bad "send after ask: exit $lkrc2"
+tmux kill-session -t "$P/asklk" 2>/dev/null
 
 exit $fail
