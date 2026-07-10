@@ -11,7 +11,7 @@ bad()  { printf '\033[31mFAIL\033[0m %s\n' "$*"; fail=1; }
 
 command -v tmux >/dev/null || { echo "tmux not installed; skipping"; exit 0; }
 cleanup() {
-  for s in idle running waiting ready ask; do tmux kill-session -t "$P/$s" 2>/dev/null; done
+  for s in idle running waiting ready ask askblk asktmo; do tmux kill-session -t "$P/$s" 2>/dev/null; done
   # remove any lock dirs and ask-state files (ours, or strays from prior runs)
   rm -rf "${TMPDIR:-/tmp}/tmux-tasks-${USER:-$(id -un)}"/tmttest_*.lock 2>/dev/null
   rm -f "${TMPDIR:-/tmp}/tmux-tasks-${USER:-$(id -un)}"/tmttest_*.ask.hash 2>/dev/null
@@ -198,5 +198,33 @@ askreply=$(printf '%s' "$askout" | jq -r .reply 2>/dev/null)
 printf '%s' "$askreply" | grep -q 'REPLY:\[.*hello world\]' && ok "ask reply contains agent output" || bad "ask reply: '$askreply'"
 printf '%s' "$askreply" | grep -q '<<<TMT_ASK:' && bad "ask reply contains marker" || ok "ask reply excludes marker"
 tmux kill-session -t "$P/ask" 2>/dev/null
+
+# ask blocked: agent quiesces on a question
+tmux kill-session -t "$P/askblk" 2>/dev/null
+tmux new-session -d -s "$P/askblk"
+# Agent: reads, prints a question, then blocks on read
+tmux send-keys -t "$P/askblk" 'printf "❯ "; while true; do read l; echo "got it"; sleep 0.3; read "a?proceed? (y/n) "; done' Enter
+sleep 1.5
+
+blkout=$("$TMT" ask "$P/askblk" --timeout 12 --quiescent 2 -- 'test input' 2>/dev/null)
+blkrc=$?
+blkstatus=$(printf '%s' "$blkout" | jq -r .status 2>/dev/null)
+[[ "$blkrc" -eq 0 ]] && ok "ask blocked exits 0" || bad "ask blocked exit: $blkrc"
+[[ "$blkstatus" == "blocked" ]] && ok "ask detects blocked status" || bad "ask blocked: '$blkstatus'"
+tmux kill-session -t "$P/askblk" 2>/dev/null
+
+# ask timeout: session that never shows a ready box
+tmux kill-session -t "$P/asktmo" 2>/dev/null
+tmux new-session -d -s "$P/asktmo"
+# Runs a long sleep — never shows ❯ or a question prompt
+tmux send-keys -t "$P/asktmo" 'sleep 120' Enter
+sleep 1
+
+tmoout=$("$TMT" ask "$P/asktmo" --timeout 4 --quiescent 2 -- 'ping' 2>/dev/null)
+tmorc=$?
+tmostatus=$(printf '%s' "$tmoout" | jq -r .status 2>/dev/null)
+[[ "$tmorc" -eq 7 ]] && ok "ask timeout exits 7" || bad "ask timeout exit: $tmorc"
+[[ "$tmostatus" == "timeout" ]] && ok "ask timeout status field" || bad "ask timeout status: '$tmostatus'"
+tmux kill-session -t "$P/asktmo" 2>/dev/null
 
 exit $fail
