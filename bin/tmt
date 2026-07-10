@@ -14,6 +14,8 @@
 #   status SESSION                          Detailed view of one session
 #   capture SESSION [--lines N]             Dump a session's pane (for humans/agents)
 #   send  SESSION -- TEXT...                Send a line of input to a session
+#   ask   SESSION [--timeout S] [--quiescent S] [--lines N] -- PROMPT
+#                                           Send prompt, await reply (JSON output)
 #   key   SESSION KEY...                    Send raw tmux keys (e.g. Enter, C-c, y)
 #   new   NAME [-- CMD...]                   Create a task session (optionally run CMD)
 #   dispatch NAME --type T [--isolation worktree|cwd] [--repo D] [--branch B]
@@ -42,7 +44,7 @@
 
 set -uo pipefail
 
-TMT_VERSION="0.3.4"
+TMT_VERSION="0.4.0"
 
 # Stable exit codes (see DESIGN.md §5) so a program consumer can branch on them.
 EX_OK=0; EX_USAGE=2; EX_NOSESSION=3; EX_LOCKED=4; EX_POLICY=5; EX_NOTMUX=6; EX_TIMEOUT=7

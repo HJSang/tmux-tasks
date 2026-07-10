@@ -3,7 +3,7 @@ _tmt() {
   local cur prev subcmds
   cur="${COMP_WORDS[COMP_CWORD]}"
   prev="${COMP_WORDS[COMP_CWORD-1]}"
-  subcmds="watch ls status capture send key new dispatch registry save restore snapshots agent-scan serve attach version help"
+  subcmds="watch ls status capture send ask key new dispatch registry save restore snapshots agent-scan serve attach version help"
 
   # complete the subcommand itself
   if [[ $COMP_CWORD -eq 1 ]]; then
@@ -27,6 +27,16 @@ _tmt() {
       ;;
     serve)
       [[ "$cur" == -* ]] && mapfile -t COMPREPLY < <(compgen -W "--filter --interval --port --lines" -- "$cur")
+      return
+      ;;
+    ask)
+      if [[ $COMP_CWORD -eq 2 ]]; then
+        local sessions
+        sessions=$(tmux list-sessions -F '#{session_name}' 2>/dev/null)
+        mapfile -t COMPREPLY < <(compgen -W "$sessions" -- "$cur")
+      elif [[ "$cur" == -* ]]; then
+        mapfile -t COMPREPLY < <(compgen -W "--timeout --quiescent --lines" -- "$cur")
+      fi
       return
       ;;
     save)
