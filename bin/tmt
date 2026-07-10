@@ -114,6 +114,70 @@ _lock_acquire() {
 
 _lock_release() { rm -rf "$(_lock_path "$1")"; }
 
+# --- readiness detection (Phase B) -------------------------------------------
+#
+# _turn_done SESSION QUIESCENT_SECS
+#   Checks if the session's pane has been stable for QUIESCENT seconds AND the
+#   tail matches a pattern indicating the agent finished. Prints one of:
+#     "done"    — ready box showing (READY_RE), agent finished its turn
+#     "blocked" — question prompt showing (PROMPT_RE minus the ready-box overlap)
+#     "active"  — pane still changing or hasn't been quiescent long enough
+#
+# Meant to be POLLED (once/sec by ask). The state file records two lines:
+# the pane hash and the epoch second that hash was first observed. The first
+# call after any change (including the very first call ever) resets the timer
+# and reports "active"; subsequent calls accumulate elapsed quiescent time.
+#
+# READY_RE is checked BEFORE PROMPT_RE: a bare `❯ ` matches both (PROMPT_RE
+# includes it as an alternative), but it is a ready box — the agent finished —
+# not a blocking question. PROMPT_RE only classifies "blocked" via its more
+# specific patterns (y/n, password:, continue?, ...).
+#
+# Uses .ask.hash (not .hash) so it never perturbs detect()'s RUNNING/STALE state.
+
+_turn_done() {
+  local sess="$1" quiescent="${2:-5}"
+  local pane last hash statef prev prev_time now elapsed
+
+  pane=$(tmux capture-pane -t "$sess" -p 2>/dev/null)
+  last=$(printf '%s\n' "$pane" | grep -v '^[[:space:]]*$' | tail -n 1)
+  hash=$(printf '%s' "$pane" | cksum | cut -d' ' -f1)
+
+  statef="$STATE_DIR/$(key_of "$sess").ask.hash"
+  now=$(date +%s)
+
+  if [[ -f "$statef" ]]; then
+    prev=$(sed -n '1p' "$statef")
+    prev_time=$(sed -n '2p' "$statef")
+  else
+    prev=""; prev_time="$now"
+  fi
+
+  if [[ "$hash" != "$prev" ]]; then
+    # Pane changed — reset the quiescence timer.
+    printf '%s\n%s\n' "$hash" "$now" > "$statef"
+    printf 'active'
+    return
+  fi
+
+  # Pane unchanged — check how long.
+  elapsed=$((now - prev_time))
+  if [[ "$elapsed" -lt "$quiescent" ]]; then
+    printf 'active'
+    return
+  fi
+
+  # Quiescent long enough. Check what's showing.
+  # READY_RE first: a bare ❯ is a ready box, not a question.
+  if [[ "$last" =~ $READY_RE ]]; then
+    printf 'done'
+  elif [[ "$last" =~ $PROMPT_RE ]]; then
+    printf 'blocked'
+  else
+    printf 'active'
+  fi
+}
+
 # Colors only when stdout is a real terminal, so a program consuming our output
 # (the orchestrator) never has to strip ANSI. NO_COLOR=1 also disables them.
 if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
@@ -991,6 +1055,7 @@ main() {
     # lock helpers in-process.
     _test_lock_acquire) _lock_acquire "$@" ;;
     _test_lock_release) _lock_release "$@" ;;
+    _test_turn_done)    _turn_done "$@" ;;
     *) die "unknown subcommand: $sub (try: tmt --help)" ;;
   esac
 }

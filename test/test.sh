@@ -11,9 +11,10 @@ bad()  { printf '\033[31mFAIL\033[0m %s\n' "$*"; fail=1; }
 
 command -v tmux >/dev/null || { echo "tmux not installed; skipping"; exit 0; }
 cleanup() {
-  for s in idle running waiting; do tmux kill-session -t "$P/$s" 2>/dev/null; done
-  # remove any lock dirs (ours, or strays left by an aborted prior run)
+  for s in idle running waiting ready; do tmux kill-session -t "$P/$s" 2>/dev/null; done
+  # remove any lock dirs and ask-state files (ours, or strays from prior runs)
   rm -rf "${TMPDIR:-/tmp}/tmux-tasks-${USER:-$(id -un)}"/tmttest_*.lock 2>/dev/null
+  rm -f "${TMPDIR:-/tmp}/tmux-tasks-${USER:-$(id -un)}"/tmttest_*.ask.hash 2>/dev/null
 }
 trap cleanup EXIT
 
@@ -163,5 +164,22 @@ echo "$deadpid" > "$statedir/$stalekey.lock/pid"
 "$TMT" send "$P/idle" -- 'blocked' 2>/dev/null; lkrc=$?
 [[ "$lkrc" -eq 4 ]] && ok "send blocked by lock" || bad "send blocked: exit $lkrc (expected 4)"
 "$TMT" _test_lock_release "$P/idle"
+
+# readiness: a session showing ❯ prompt after quiescence is "done".
+# The trailing sleep holds the foreground so the shell prompt doesn't repaint
+# over the ❯ (mimics an agent TUI sitting at its ready box).
+tmux kill-session -t "$P/ready" 2>/dev/null
+tmux new-session -d -s "$P/ready"
+tmux send-keys -t "$P/ready" 'printf "output\n"; sleep 0.5; printf "❯ "; sleep 60' Enter
+sleep 2
+# _turn_done is a polled helper: the first call seeds the quiescence timer
+# (state file records hash + first-seen time), later calls measure elapsed.
+seed=$("$TMT" _test_turn_done "$P/ready" 1)
+[[ "$seed" == "active" ]] && ok "turn_done first poll seeds timer (active)" || bad "turn_done seed: got '$seed'"
+sleep 1.2
+# Pane has been quiescent >1s since the seed call, with ❯ showing
+result=$("$TMT" _test_turn_done "$P/ready" 1)
+[[ "$result" == "done" ]] && ok "turn_done detects ready box" || bad "turn_done: got '$result'"
+tmux kill-session -t "$P/ready" 2>/dev/null
 
 exit $fail
