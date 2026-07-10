@@ -516,6 +516,112 @@ cmd_agent_scan() {
   fi
 }
 
+# --- ask: send-and-await-reply (Phase B) --------------------------------------
+#
+# tmt ask SESSION [--timeout S] [--quiescent S] [--lines N] -- "prompt"
+#
+# Sends a prompt with an embedded marker, waits for the agent to complete its
+# turn (quiescence + ready-box or question-prompt), then extracts and returns
+# only the new output between the marker and the input box as JSON.
+
+cmd_ask() {
+  have_tmux
+  need jq
+  local sess="${1:?usage: tmt ask SESSION [--timeout S] [--quiescent S] [--lines N] -- PROMPT}"; shift
+  tmux has-session -t "$sess" 2>/dev/null || die "$EX_NOSESSION" "no such session: $sess"
+
+  local timeout=300 quiescent=5 lines=5000
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --timeout)   timeout="$2"; shift 2 ;;
+      --quiescent) quiescent="$2"; shift 2 ;;
+      --lines)     lines="$2"; shift 2 ;;
+      --)          shift; break ;;
+      *)           break ;;
+    esac
+  done
+  local prompt="$*"
+  [[ -z "$prompt" ]] && die "ask: no prompt provided"
+
+  _lock_acquire "$sess"
+  trap '_lock_release "$sess"; trap - RETURN' RETURN
+
+  # Generate a unique marker. The wire text is one line: marker + prompt.
+  local id="$$-$SECONDS"
+  local marker="<<<TMT_ASK:$id>>>"
+  local wire="$marker $prompt"
+
+  # Clear prior ask-hash state so the quiescence timer starts fresh.
+  rm -f "$STATE_DIR/$(key_of "$sess").ask.hash"
+
+  # Send the marker+prompt as one turn.
+  _send_line "$sess" "$wire" || die "ask: send failed"
+
+  # Poll once/second until done, blocked, or timeout.
+  local elapsed=0 state="active"
+  while [[ "$elapsed" -lt "$timeout" ]]; do
+    sleep 1
+    elapsed=$((elapsed + 1))
+    state=$(_turn_done "$sess" "$quiescent")
+    [[ "$state" == "active" ]] && continue
+    break
+  done
+  [[ "$state" == "active" ]] && state="timeout"
+
+  # Capture and extract the reply region.
+  local pane reply=""
+  pane=$(tmux capture-pane -t "$sess" -p -S "-$lines" 2>/dev/null)
+
+  # Anchor on the FIRST occurrence of our marker: that is the echoed input
+  # line. The marker is unique per ask, so stale scrollback can't match; a
+  # LATER occurrence can only be the agent quoting our prompt back (part of
+  # the reply), which must not swallow the reply region.
+  local marker_line_num
+  marker_line_num=$(printf '%s\n' "$pane" | grep -nF "$marker" | head -1 | cut -d: -f1)
+
+  if [[ -n "$marker_line_num" ]]; then
+    # Everything after the marker line, then trim trailing ready-box/blanks.
+    reply=$(printf '%s\n' "$pane" | tail -n "+$((marker_line_num + 1))" | _trim_trailing_ready)
+    # The marker is tmt plumbing: scrub any echo of it from the reply body.
+    reply=${reply//"$marker"/}
+  fi
+
+  # Clean up the ask-hash state file.
+  rm -f "$STATE_DIR/$(key_of "$sess").ask.hash"
+
+  # Output JSON.
+  local exit_code=0
+  [[ "$state" == "timeout" ]] && exit_code=$EX_TIMEOUT
+  jq -n --arg sess "$sess" --arg id "$id" --arg status "$state" \
+        --argjson elapsed "$elapsed" --arg reply "$reply" \
+    '{session:$sess, id:$id, status:$status, elapsed_s:$elapsed, reply:$reply}'
+  return "$exit_code"
+}
+
+# Trim trailing lines that match READY_RE or are blank. Reads stdin, writes stdout.
+_trim_trailing_ready() {
+  local -a buf=()
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    buf+=("$line")
+  done
+  # Walk backward, dropping ready-box and blank lines.
+  local i=${#buf[@]}
+  while [[ $i -gt 0 ]]; do
+    i=$((i - 1))
+    local l="${buf[$i]}"
+    if [[ -z "${l// /}" ]] || [[ "$l" =~ $READY_RE ]]; then
+      unset 'buf[i]'
+    else
+      break
+    fi
+  done
+  # Print remaining lines (preserving order).
+  local line
+  for line in "${buf[@]+"${buf[@]}"}"; do
+    printf '%s\n' "$line"
+  done
+}
+
 # --- serve: live HTML dashboard -------------------------------------------
 #
 # Serves a static index.html shell once, plus a data.json the shell polls every
@@ -1039,6 +1145,7 @@ main() {
     status)      cmd_status "$@" ;;
     capture)     cmd_capture "$@" ;;
     send)        cmd_send "$@" ;;
+    ask)         cmd_ask "$@" ;;
     key)         cmd_key "$@" ;;
     new)         cmd_new "$@" ;;
     dispatch)    cmd_dispatch "$@" ;;

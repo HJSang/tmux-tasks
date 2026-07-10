@@ -11,7 +11,7 @@ bad()  { printf '\033[31mFAIL\033[0m %s\n' "$*"; fail=1; }
 
 command -v tmux >/dev/null || { echo "tmux not installed; skipping"; exit 0; }
 cleanup() {
-  for s in idle running waiting ready; do tmux kill-session -t "$P/$s" 2>/dev/null; done
+  for s in idle running waiting ready ask; do tmux kill-session -t "$P/$s" 2>/dev/null; done
   # remove any lock dirs and ask-state files (ours, or strays from prior runs)
   rm -rf "${TMPDIR:-/tmp}/tmux-tasks-${USER:-$(id -un)}"/tmttest_*.lock 2>/dev/null
   rm -f "${TMPDIR:-/tmp}/tmux-tasks-${USER:-$(id -un)}"/tmttest_*.ask.hash 2>/dev/null
@@ -181,5 +181,22 @@ sleep 1.2
 result=$("$TMT" _test_turn_done "$P/ready" 1)
 [[ "$result" == "done" ]] && ok "turn_done detects ready box" || bad "turn_done: got '$result'"
 tmux kill-session -t "$P/ready" 2>/dev/null
+
+# ask round-trip: send prompt, get reply as JSON
+tmux kill-session -t "$P/ask" 2>/dev/null
+tmux new-session -d -s "$P/ask"
+# A mini agent: reads a line, prints a reply, re-shows ❯ (held by sleep)
+tmux send-keys -t "$P/ask" 'while true; do printf "❯ "; read l; echo "REPLY:[$l]"; done' Enter
+sleep 1.5
+
+askout=$("$TMT" ask "$P/ask" --timeout 15 --quiescent 2 -- 'hello world' 2>/dev/null)
+askrc=$?
+askstatus=$(printf '%s' "$askout" | jq -r .status 2>/dev/null)
+askreply=$(printf '%s' "$askout" | jq -r .reply 2>/dev/null)
+[[ "$askrc" -eq 0 ]] && ok "ask exits 0" || bad "ask exit: $askrc"
+[[ "$askstatus" == "done" ]] && ok "ask returns status done" || bad "ask status: '$askstatus'"
+printf '%s' "$askreply" | grep -q 'REPLY:\[.*hello world\]' && ok "ask reply contains agent output" || bad "ask reply: '$askreply'"
+printf '%s' "$askreply" | grep -q '<<<TMT_ASK:' && bad "ask reply contains marker" || ok "ask reply excludes marker"
+tmux kill-session -t "$P/ask" 2>/dev/null
 
 exit $fail
