@@ -158,4 +158,10 @@ echo "$deadpid" > "$statedir/$stalekey.lock/pid"
 "$TMT" _test_lock_acquire "$P/idle" $$ && ok "stale lock stolen" || bad "stale lock not stolen"
 "$TMT" _test_lock_release "$P/idle"
 
+# send respects lock: holding a lock blocks tmt send
+"$TMT" _test_lock_acquire "$P/idle" $$
+"$TMT" send "$P/idle" -- 'blocked' 2>/dev/null; lkrc=$?
+[[ "$lkrc" -eq 4 ]] && ok "send blocked by lock" || bad "send blocked: exit $lkrc (expected 4)"
+"$TMT" _test_lock_release "$P/idle"
+
 exit $fail

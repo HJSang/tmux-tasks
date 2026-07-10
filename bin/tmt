@@ -265,6 +265,10 @@ cmd_send() {
   tmux has-session -t "$sess" 2>/dev/null || die "$EX_NOSESSION" "no such session: $sess"
   [[ "${1:-}" == "--" ]] && shift
   local text="$*"
+  _lock_acquire "$sess"
+  # RETURN traps are global in bash: clear it as it fires so it doesn't fire
+  # again when main() returns (where $sess is out of scope).
+  trap '_lock_release "$sess"; trap - RETURN' RETURN
   _send_line "$sess" "$text" && \
     printf '%s→ sent to %s:%s %s\n' "$c_grn" "$sess" "$c_reset" "$text"
 }
@@ -273,6 +277,8 @@ cmd_key() {
   have_tmux
   local sess="${1:?usage: tmt key SESSION KEY...}"; shift
   tmux has-session -t "$sess" 2>/dev/null || die "$EX_NOSESSION" "no such session: $sess"
+  _lock_acquire "$sess"
+  trap '_lock_release "$sess"; trap - RETURN' RETURN
   tmux send-keys -t "$sess" "$@" && \
     printf '%s→ sent keys to %s:%s %s\n' "$c_grn" "$sess" "$c_reset" "$*"
 }
